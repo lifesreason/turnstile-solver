@@ -879,9 +879,79 @@ class TurnstileAPIServer:
 
         return context_options
 
-    async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
+    @staticmethod
+    def _normalize_task_proxy(proxy: Optional[str]) -> Optional[str]:
+        """Normalize per-task proxy string for Playwright/Camoufox context.
+
+        Accepts:
+          - http://user:pass@host:port
+          - http://host:port
+          - host:port
+          - host:port:user:pass
+          - scheme:host:port:user:pass
+        """
+        raw = str(proxy or "").strip()
+        if not raw:
+            return None
+        if "://" in raw:
+            return raw
+        parts = raw.split(":")
+        if len(parts) == 2:
+            return f"http://{parts[0]}:{parts[1]}"
+        if len(parts) == 4 and parts[1].isdigit():
+            # host:port:user:pass
+            return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+        if len(parts) == 5:
+            # scheme:host:port:user:pass (legacy proxies.txt)
+            return f"{parts[0]}://{parts[3]}:{parts[4]}@{parts[1]}:{parts[2]}"
+        return raw
+
+    @staticmethod
+    def _redact_proxy(proxy: Optional[str]) -> str:
+        raw = str(proxy or "").strip()
+        if not raw:
+            return ""
+        # hide credentials for logs
+        try:
+            if "@" in raw and "://" in raw:
+                scheme, rest = raw.split("://", 1)
+                auth, hostpart = rest.rsplit("@", 1)
+                return f"{scheme}://***:***@{hostpart}"
+        except Exception:
+            pass
+        return raw
+
+    def _pick_proxy(self, task_proxy: Optional[str] = None) -> Optional[str]:
+        """Per-task proxy first; else optional proxies.txt when --proxy enabled."""
+        normalized = self._normalize_task_proxy(task_proxy)
+        if normalized:
+            return normalized
+        if not self.proxy_support:
+            return None
+        proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
+        try:
+            with open(proxy_file_path) as proxy_file:
+                proxies = [line.strip() for line in proxy_file if line.strip()]
+            if not proxies:
+                return None
+            return self._normalize_task_proxy(random.choice(proxies))
+        except FileNotFoundError:
+            logger.warning(f"Proxy file not found: {proxy_file_path}")
+            return None
+        except Exception as e:
+            logger.error(f"Error reading proxy file: {str(e)}")
+            return None
+
+    async def _solve_turnstile(
+        self,
+        task_id: str,
+        url: str,
+        sitekey: str,
+        action: Optional[str] = None,
+        cdata: Optional[str] = None,
+        proxy: Optional[str] = None,
+    ):
         """Solve the Turnstile challenge."""
-        proxy = None
         context = None
         page = None
         start_time = time.time()
@@ -917,49 +987,24 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.warning(f"Browser {index}: Cannot check browser state: {str(e)}")
 
-            if self.proxy_support:
-                proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
-
-                try:
-                    with open(proxy_file_path) as proxy_file:
-                        proxies = [line.strip() for line in proxy_file if line.strip()]
-
-                    proxy = random.choice(proxies) if proxies else None
-
-                    if self.debug and proxy:
-                        logger.debug(f"Browser {index}: Selected proxy: {proxy}")
-                    elif self.debug and not proxy:
-                        logger.debug(f"Browser {index}: No proxies available")
-
-                except FileNotFoundError:
-                    logger.warning(f"Proxy file not found: {proxy_file_path}")
-                    proxy = None
-                except Exception as e:
-                    logger.error(f"Error reading proxy file: {str(e)}")
-                    proxy = None
-
-                if proxy and self.debug:
-                    logger.debug(f"Browser {index}: Creating context with proxy enabled")
-                elif self.debug:
+            # Per-task proxy takes priority; falls back to proxies.txt when --proxy is on.
+            proxy = self._pick_proxy(proxy)
+            if self.debug:
+                if proxy:
+                    logger.debug(f"Browser {index}: Creating context with proxy {self._redact_proxy(proxy)}")
+                else:
                     logger.debug(f"Browser {index}: Creating context without proxy")
 
-                context_options = self._build_context_options(browser_config or {}, proxy if self.proxy_support else None)
-                try:
-                    context = await browser.new_context(**context_options)
-                except Exception as ctx_err:
-                    # Fallback for Camoufox protocol mismatches / stricter option sets.
-                    if self.debug:
-                        logger.warning(f"Browser {index}: new_context failed ({ctx_err}); retry minimal options")
-                    context = await browser.new_context(no_viewport=True)
-            else:
+            context_options = self._build_context_options(browser_config or {}, proxy)
+            try:
+                context = await browser.new_context(**context_options)
+            except Exception as ctx_err:
+                # Fallback for Camoufox protocol mismatches / stricter option sets.
                 if self.debug:
-                    logger.debug(f"Browser {index}: Creating context without proxy")
-                context_options = self._build_context_options(browser_config or {}, None)
+                    logger.warning(f"Browser {index}: new_context failed ({ctx_err}); retry minimal options")
                 try:
-                    context = await browser.new_context(**context_options)
-                except Exception as ctx_err:
-                    if self.debug:
-                        logger.warning(f"Browser {index}: new_context failed ({ctx_err}); retry minimal options")
+                    context = await browser.new_context(no_viewport=True, **({"proxy": context_options.get("proxy")} if context_options.get("proxy") else {}))
+                except Exception:
                     context = await browser.new_context(no_viewport=True)
 
             page = await context.new_page()
@@ -1129,6 +1174,7 @@ class TurnstileAPIServer:
         sitekey: str,
         action: Optional[str] = None,
         cdata: Optional[str] = None,
+        proxy: Optional[str] = None,
     ):
         """创建任务并异步求解，返回 (task_id, error_response)。"""
         if not url or not sitekey:
@@ -1145,7 +1191,8 @@ class TurnstileAPIServer:
             "url": url,
             "sitekey": sitekey,
             "action": action,
-            "cdata": cdata
+            "cdata": cdata,
+            "proxy": self._redact_proxy(proxy) if proxy else "",
         })
 
         try:
@@ -1156,10 +1203,14 @@ class TurnstileAPIServer:
                     sitekey=sitekey,
                     action=action,
                     cdata=cdata,
+                    proxy=proxy,
                 )
             )
             if self.debug:
-                logger.debug(f"Request completed with taskid {task_id}.")
+                logger.debug(
+                    f"Request completed with taskid {task_id}"
+                    + (f" proxy={self._redact_proxy(proxy)}" if proxy else " proxy=none")
+                )
             return task_id, None
         except Exception as e:
             logger.error(f"Unexpected error processing request: {str(e)}")
@@ -1216,8 +1267,9 @@ class TurnstileAPIServer:
         sitekey = request.args.get('sitekey')
         action = request.args.get('action')
         cdata = request.args.get('cdata')
+        proxy = request.args.get('proxy')
 
-        task_id, err = await self._enqueue_turnstile(url, sitekey, action, cdata)
+        task_id, err = await self._enqueue_turnstile(url, sitekey, action, cdata, proxy=proxy)
         if err:
             return jsonify(err), 200
         return jsonify({"errorId": 0, "taskId": task_id}), 200
@@ -1280,7 +1332,31 @@ class TurnstileAPIServer:
             action = action or metadata.get("action")
             cdata = cdata or metadata.get("cdata")
 
-        task_id, err = await self._enqueue_turnstile(url, sitekey, action, cdata)
+        # Per-task proxy (optional). Preferred over process-level proxies.txt.
+        # Accept common shapes used by CapSolver / custom clients.
+        proxy = (
+            task.get("proxy")
+            or task.get("proxyUrl")
+            or task.get("proxyURL")
+            or ""
+        )
+        if not proxy:
+            # CapSolver-like split fields
+            addr = str(task.get("proxyAddress") or task.get("proxyHost") or "").strip()
+            port = str(task.get("proxyPort") or "").strip()
+            user = str(task.get("proxyLogin") or task.get("proxyUsername") or "").strip()
+            password = str(task.get("proxyPassword") or "").strip()
+            if addr and port:
+                if user:
+                    proxy = f"http://{user}:{password}@{addr}:{port}"
+                else:
+                    proxy = f"http://{addr}:{port}"
+        if isinstance(metadata, dict) and not proxy:
+            proxy = metadata.get("proxy") or metadata.get("proxyUrl") or ""
+
+        task_id, err = await self._enqueue_turnstile(
+            url, sitekey, action, cdata, proxy=str(proxy or "").strip() or None
+        )
         if err:
             return jsonify(err), 200
         return jsonify({"errorId": 0, "taskId": task_id}), 200
@@ -1388,9 +1464,11 @@ class TurnstileAPIServer:
   "task": {
     "type": "TurnstileTaskProxyless",
     "websiteURL": "https://example.com",
-    "websiteKey": "0x4AAAA..."
+    "websiteKey": "0x4AAAA...",
+    "proxy": "http://user:pass@host:port"
   }
 }</pre>
+                        <p class="text-xs text-gray-400 mt-2">proxy 可选：任务级代理优先；未传时若启动带 --proxy 则从 proxies.txt 随机。</p>
                     </div>
 
 

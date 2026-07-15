@@ -72,13 +72,14 @@ echo <GITHUB_TOKEN> | docker login ghcr.io -u jeck5001 --password-stdin
 ### YesCaptcha 兼容
 
 ```bash
-# 1) 创建任务
+# 1) 创建任务（可选 proxy：与业务出口一致，提高 token 被接受概率）
 curl -s http://127.0.0.1:5072/createTask -H 'Content-Type: application/json' -d '{
   "clientKey": "local",
   "task": {
     "type": "TurnstileTaskProxyless",
     "websiteURL": "https://accounts.x.ai/sign-up",
-    "websiteKey": "0x4AAAAAAAhr9JGVDZbrZOo0"
+    "websiteKey": "0x4AAAAAAAhr9JGVDZbrZOo0",
+    "proxy": "http://127.0.0.1:7890"
   }
 }'
 # {"errorId":0,"taskId":"..."}
@@ -93,10 +94,18 @@ curl -s http://127.0.0.1:5072/getTaskResult -H 'Content-Type: application/json' 
 
 支持的 `task.type`：`TurnstileTaskProxyless`、`TurnstileTaskProxylessM1/M2`、`TurnstileTask`、`AntiTurnstileTask*` 等（本地均走同一解题路径）。
 
+### 代理优先级
+
+1. **任务级** `task.proxy` / `proxyUrl` / `proxyAddress`+`proxyPort`(+`proxyLogin`/`proxyPassword`) — 推荐  
+2. 进程级：启动 `--proxy` + 工作目录 `proxies.txt` 随机一行  
+3. 无代理直连  
+
+> 云端 YesCaptcha 的 Proxyless 任务会忽略 proxy；仅本本地 solver 实现任务级代理。
+
 ### 原生 GET
 
 ```text
-GET /turnstile?url=https://example.com&sitekey=0x4AAAA...
+GET /turnstile?url=https://example.com&sitekey=0x4AAAA...&proxy=http://host:port
 GET /result?id=<taskId>
 ```
 
