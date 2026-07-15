@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+__pycache__
+logs
+keys
+*.log
+*.pid
+.env
+proxies.txt
+*.md
+!README.md

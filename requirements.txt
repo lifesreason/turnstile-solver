@@ -1,7 +1,8 @@
 # Standalone Cloudflare Turnstile Solver
 quart>=0.19
 camoufox>=0.4
-patchright>=1.50
+# patchright 仅在用 chromium 时需要；默认 camoufox 可省安装
+# patchright>=1.50
 rich>=13
 requests>=2.31
 python-dotenv>=1.0

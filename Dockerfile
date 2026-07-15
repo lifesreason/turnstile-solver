@@ -1,5 +1,4 @@
-# Standalone Cloudflare Turnstile Solver
-# Multi-arch: linux/amd64, linux/arm64 (Camoufox + system libs)
+# Standalone Cloudflare Turnstile Solver（默认 amd64，构建更快）
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -17,12 +16,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Browser runtime deps (Camoufox/Firefox + Chromium path + fonts)
+# Camoufox/Firefox 运行时依赖（精简字体）
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         fonts-liberation \
-        fonts-noto-color-emoji \
         libasound2 \
         libatk-bridge2.0-0 \
         libatk1.0-0 \
@@ -47,15 +45,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxss1 \
         libxtst6 \
         xvfb \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 COPY requirements.txt /app/requirements.txt
-RUN python -m pip install --no-cache-dir -U pip setuptools wheel \
-    && python -m pip install --no-cache-dir -r /app/requirements.txt
-
-# Prefetch browser binaries into image layers (first request stays fast)
-RUN python -m camoufox fetch \
-    && python -m patchright install chromium || true
+RUN python -m pip install --no-cache-dir -U pip \
+    && python -m pip install --no-cache-dir -r /app/requirements.txt \
+    # 只预取 Camoufox（默认浏览器）；不装 patchright chromium，省大量时间/体积
+    && python -m camoufox fetch
 
 COPY api_solver.py browser_configs.py db_results.py /app/
 COPY entrypoint.sh /app/entrypoint.sh
