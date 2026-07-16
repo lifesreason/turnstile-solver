@@ -9,7 +9,6 @@ from typing import Optional, Union
 import argparse
 from quart import Quart, request, jsonify
 from camoufox.async_api import AsyncCamoufox
-from patchright.async_api import async_playwright
 from db_results import init_db, save_result, load_result, cleanup_old_results
 from browser_configs import browser_config
 from rich.console import Console
@@ -202,6 +201,7 @@ class TurnstileAPIServer:
         camoufox = None
 
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
+            from patchright.async_api import async_playwright
             playwright = await async_playwright().start()
             self._playwright = playwright
         elif self.browser_type == "camoufox":
