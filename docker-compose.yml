@@ -14,17 +14,18 @@ services:
     environment:
       TURNSTILE_HOST: "0.0.0.0"
       TURNSTILE_PORT: "5072"
-      TURNSTILE_THREAD: "${TURNSTILE_THREAD:-2}"
+      TURNSTILE_THREAD: "${TURNSTILE_THREAD:-1}"
+      TURNSTILE_BROWSER_INSTANCES: "${TURNSTILE_BROWSER_INSTANCES:-1}"
       TURNSTILE_BROWSER_TYPE: "${TURNSTILE_BROWSER_TYPE:-camoufox}"
-      TURNSTILE_DEBUG: "${TURNSTILE_DEBUG:-1}"
+      TURNSTILE_DEBUG: "${TURNSTILE_DEBUG:-0}"
       TURNSTILE_LAZY: "${TURNSTILE_LAZY:-1}"
-      TURNSTILE_IDLE_SEC: "${TURNSTILE_IDLE_SEC:-180}"
+      TURNSTILE_IDLE_SEC: "${TURNSTILE_IDLE_SEC:-60}"
       # 生产建议设置鉴权：业务 createTask 时 clientKey 填同一值
       # API_KEY: "change-me"
-    # 浏览器需要足够共享内存
-    shm_size: "2gb"
+    # 单浏览器默认 512MB 共享内存即可；高并发或浏览器崩溃时再按需调大
+    shm_size: "${TURNSTILE_SHM_SIZE:-512mb}"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5072/health"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:5072/health', timeout=5).read()\""]
       interval: 20s
       timeout: 5s
       retries: 8

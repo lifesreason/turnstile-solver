@@ -66,6 +66,7 @@ class TurnstileAPIServer:
         self.browser_type = browser_type
         self.headless = headless
         self.thread_count = max(1, int(thread or 1))
+        self.browser_instance_count = self._resolve_browser_instance_count()
         self.proxy_support = proxy_support
         self.browser_pool = asyncio.Queue()
         self.use_random_config = use_random_config
@@ -75,7 +76,8 @@ class TurnstileAPIServer:
 
         # Lazy pool: do not keep Camoufox/Chromium warm while idle.
         # TURNSTILE_LAZY=1 (default) starts browsers on first solve request.
-        # TURNSTILE_IDLE_SEC (default 180) reclaims the pool after quiet period.
+        # TURNSTILE_IDLE_SEC reclaims the pool after quiet period.
+        # TURNSTILE_BROWSER_INSTANCES keeps process count below concurrency slots.
         lazy_raw = (os.getenv("TURNSTILE_LAZY", "1") or "1").strip().lower()
         self.lazy_browsers = lazy_raw not in ("0", "false", "no", "off")
         try:
@@ -119,6 +121,14 @@ class TurnstileAPIServer:
             self.browser_args.append(f"--user-agent={self.useragent}")
 
         self._setup_routes()
+
+    def _resolve_browser_instance_count(self) -> int:
+        raw_value = os.getenv("TURNSTILE_BROWSER_INSTANCES", "1")
+        try:
+            requested = int(str(raw_value or "1").strip())
+        except (TypeError, ValueError):
+            requested = 1
+        return max(1, min(self.thread_count, requested))
 
     def display_welcome(self):
         """Displays welcome screen with logo."""
@@ -177,7 +187,9 @@ class TurnstileAPIServer:
             if self.lazy_browsers:
                 logger.info(
                     f"Lazy browser mode ON — pool starts on first captcha "
-                    f"(thread={self.thread_count}, idle_reclaim={self.idle_sec:.0f}s)"
+                    f"(concurrency_slots={self.thread_count}, "
+                    f"browser_instances={self.browser_instance_count}, "
+                    f"idle_reclaim={self.idle_sec:.0f}s)"
                 )
                 if self.idle_sec > 0:
                     self._idle_task = asyncio.create_task(self._idle_reaper())
@@ -242,7 +254,8 @@ class TurnstileAPIServer:
             })
 
         owned = []
-        for i in range(self.thread_count):
+        browsers = []
+        for i in range(self.browser_instance_count):
             config = browser_configs[i]
 
             browser_args = [
@@ -265,15 +278,26 @@ class TurnstileAPIServer:
             if browser:
                 item = (i + 1, browser, config)
                 owned.append(item)
-                await self.browser_pool.put(item)
+                browsers.append(browser)
 
             if self.debug:
-                logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
+                logger.info(f"Browser instance {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
+
+        if not browsers:
+            raise RuntimeError("No browser instances were initialized")
+
+        for slot_index in range(self.thread_count):
+            browser = browsers[slot_index % len(browsers)]
+            config = browser_configs[slot_index]
+            await self.browser_pool.put((slot_index + 1, browser, config))
 
         self._owned_browsers = owned
         self._pool_ready = True
         self._last_used = time.time()
-        logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
+        logger.info(
+            f"Browser pool initialized with {self.browser_pool.qsize()} "
+            f"concurrency slots over {len(self._owned_browsers)} browser instances"
+        )
 
         if self.use_random_config:
             logger.info(f"Each browser in pool received random configuration")
@@ -284,9 +308,9 @@ class TurnstileAPIServer:
 
         if self.debug:
             for i, config in enumerate(browser_configs):
-                logger.debug(f"Browser {i+1} config: {config['browser_name']} {config['browser_version']}")
-                logger.debug(f"Browser {i+1} User-Agent: {config['useragent']}")
-                logger.debug(f"Browser {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
+                logger.debug(f"Browser slot {i+1} config: {config['browser_name']} {config['browser_version']}")
+                logger.debug(f"Browser slot {i+1} User-Agent: {config['useragent']}")
+                logger.debug(f"Browser slot {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
 
     async def _drain_pool_discard(self) -> None:
         """Empty the asyncio queue without closing browsers (caller closes)."""
@@ -297,6 +321,32 @@ class TurnstileAPIServer:
                 break
             except Exception:
                 break
+
+    async def _discard_browser_slots(self, bad_browser) -> int:
+        """Remove queued concurrency slots that point to a dead shared browser."""
+        kept = []
+        removed = 0
+        while True:
+            try:
+                item = self.browser_pool.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            except Exception:
+                break
+
+            try:
+                _index, queued_browser, _config = item
+            except Exception:
+                continue
+            if queued_browser is bad_browser:
+                removed += 1
+            else:
+                kept.append(item)
+
+        for item in kept:
+            await self.browser_pool.put(item)
+
+        return removed
 
     async def _close_maybe_async(self, obj, *method_names: str, label: str = "resource") -> bool:
         """Best-effort close helper for browser/driver objects."""
@@ -446,7 +496,8 @@ class TurnstileAPIServer:
                 # All browsers currently checked out — nothing to warm.
                 return
             logger.info(
-                f"Warming browser pool (thread={self.thread_count}, type={self.browser_type})"
+                f"Warming browser pool (concurrency_slots={self.thread_count}, "
+                f"browser_instances={self.browser_instance_count}, type={self.browser_type})"
             )
             if self._pool_ready or self._owned_browsers or self._playwright or self._camoufox:
                 await self._shutdown_browsers()
@@ -979,7 +1030,9 @@ class TurnstileAPIServer:
                 if hasattr(browser, 'is_connected') and not browser.is_connected():
                     if self.debug:
                         logger.warning(f"Browser {index}: Browser disconnected, skipping")
-                    await self.browser_pool.put((index, browser, browser_config))
+                    removed = await self._discard_browser_slots(browser)
+                    if self.debug and removed:
+                        logger.warning(f"Browser {index}: Removed {removed} queued slots for disconnected browser")
                     acquired = False
                     await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": "browser_disconnected"})
                     return
@@ -1139,8 +1192,10 @@ class TurnstileAPIServer:
                             await self.browser_pool.put((index, browser, browser_config))
                             if self.debug:
                                 logger.debug(f"Browser {index}: Browser returned to pool")
-                        elif self.debug:
-                            logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
+                        else:
+                            removed = await self._discard_browser_slots(browser)
+                            if self.debug:
+                                logger.warning(f"Browser {index}: Browser disconnected, not returning to pool; removed {removed} queued slots")
                 except Exception as e:
                     if self.debug:
                         logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
@@ -1396,6 +1451,8 @@ class TurnstileAPIServer:
             "idle_sec": self.idle_sec,
             "pool_ready": bool(self._pool_ready),
             "thread": self.thread_count,
+            "concurrency_slots": self.thread_count,
+            "browser_instances": self.browser_instance_count,
             "browser_type": self.browser_type,
             "queue": self.browser_pool.qsize(),
             "owned": len(self._owned_browsers or []),
@@ -1420,6 +1477,7 @@ class TurnstileAPIServer:
             "in_flight_before": in_flight,
             "pool_ready": bool(self._pool_ready),
             "owned": len(self._owned_browsers or []),
+            "browser_instances": self.browser_instance_count,
             "queue": self.browser_pool.qsize(),
             "in_flight": int(self._in_flight or 0),
         }), 200
@@ -1505,8 +1563,8 @@ def parse_args():
     parser.add_argument('--no-headless', action='store_true', help='Run the browser with GUI (disable headless mode). By default, headless mode is enabled.')
     parser.add_argument('--useragent', type=str, help='User-Agent string (if not specified, random configuration is used)')
     parser.add_argument('--debug', action='store_true', help='Enable or disable debug mode for additional logging and troubleshooting information (default: False)')
-    parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox (default: chromium)')
-    parser.add_argument('--thread', type=int, default=4, help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
+    parser.add_argument('--browser_type', type=str, default='camoufox', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox (default: camoufox)')
+    parser.add_argument('--thread', type=int, default=1, help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
     parser.add_argument('--proxy', action='store_true', help='Enable proxy support for the solver (Default: False)')
     parser.add_argument('--random', action='store_true', help='Use random User-Agent and Sec-CH-UA configuration from pool')
     parser.add_argument('--browser', type=str, help='Specify browser name to use (e.g., chrome, firefox)')

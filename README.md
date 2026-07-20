@@ -53,19 +53,23 @@ echo <GITHUB_TOKEN> | docker login ghcr.io -u jeck5001 --password-stdin
 |------|------|------|
 | `TURNSTILE_HOST` | `0.0.0.0` | 监听地址 |
 | `TURNSTILE_PORT` | `5072` | 端口 |
-| `TURNSTILE_THREAD` | `2` | 浏览器池大小（并发解题数） |
+| `TURNSTILE_THREAD` | `1` | 并发解题槽位数 |
+| `TURNSTILE_BROWSER_INSTANCES` | `1` | 真实浏览器进程数；低内存保持 `1`，需要更强隔离时再调高 |
 | `TURNSTILE_BROWSER_TYPE` | `camoufox` | `camoufox` / `chromium` / `chrome` / `msedge` |
-| `TURNSTILE_DEBUG` | `1` | 详细日志 |
+| `TURNSTILE_DEBUG` | `0` | 详细日志 |
 | `TURNSTILE_LAZY` | `1` | 首次请求再启动浏览器 |
-| `TURNSTILE_IDLE_SEC` | `180` | 空闲回收秒数，`0` 关闭 |
+| `TURNSTILE_IDLE_SEC` | `60` | 空闲回收秒数，`0` 关闭 |
 | `TURNSTILE_PROXY` | `0` | `1` 时读取 `proxies.txt` |
+| `TURNSTILE_SHM_SIZE` | `512mb` | Docker `/dev/shm` 大小；稳定优先可设 `1gb` 或 `2gb` |
 | `API_KEY` | 空 | 设置后请求必须带相同 `clientKey` |
 
 ### 资源建议
 
-- 内存：≥ 2GB（Camoufox 较吃内存；`TURNSTILE_THREAD=2~3`）
-- `shm_size: 2gb`（浏览器必需）
+- 内存：默认 1 个真实浏览器进程，建议预留 ≥ 1GB；需要更高并发时优先调大 `TURNSTILE_THREAD`，只有需要多个独立浏览器进程时再调大 `TURNSTILE_BROWSER_INSTANCES`
+- `shm_size: 512mb`；只有在页面复杂、并发调高或浏览器崩溃时再上调
 - CPU：2 核以上更稳
+
+> 常见的“启动即占用 2G”来自旧版 `docker-compose.yml` 的共享内存配置，而不是服务进程本身。默认配置已改为懒加载 + 单浏览器进程 + 60 秒空闲回收。`TURNSTILE_THREAD` 现在控制并发槽，默认不会再按并发槽启动同等数量的浏览器进程。
 
 ## 协议示例
 
