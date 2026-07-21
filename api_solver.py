@@ -735,6 +735,11 @@ class TurnstileAPIServer:
                 cdata=cdata,
                 proxy=proxy,
             )
+            if isinstance(result, dict) and result.get("value") == "CAPTCHA_FAIL":
+                logger.error(
+                    f"Worker failed for task {task_id}: "
+                    f"{result.get('error') or 'unknown_error'}"
+                )
             await save_result(task_id, "turnstile", result)
 
     async def _ensure_pool(self) -> None:
@@ -1030,9 +1035,48 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index}: Safe click failed for '{selector}': {str(e)}")
             return False
 
+    async def _detect_turnstile_params(self, page, index: int) -> dict:
+        """Read action/cData from an existing widget when the caller omitted them."""
+        try:
+            params = await page.evaluate("""
+            () => {
+              const el = document.querySelector('.cf-turnstile,[data-sitekey]');
+              if (!el) return {};
+              return {
+                sitekey: el.getAttribute('data-sitekey') || '',
+                action: el.getAttribute('data-action') || '',
+                cdata: el.getAttribute('data-cdata') || el.getAttribute('data-cData') || ''
+              };
+            }
+            """)
+            if isinstance(params, dict):
+                if self.debug and (params.get("action") or params.get("cdata")):
+                    logger.debug(
+                        f"Browser {index}: Detected Turnstile params "
+                        f"action={params.get('action') or ''} cdata={'set' if params.get('cdata') else ''}"
+                    )
+                return params
+        except Exception as e:
+            if self.debug:
+                logger.debug(f"Browser {index}: Detect Turnstile params failed: {e}")
+        return {}
+
     async def _inject_captcha_directly(self, page, websiteKey: str, action: str = '', cdata: str = '', index: int = 0):
         """Inject CAPTCHA directly into the target website"""
+        sitekey_js = json.dumps(websiteKey or "")
+        action_js = json.dumps(action or "")
+        cdata_js = json.dumps(cdata or "")
+        action_attr = f"captchaDiv.setAttribute('data-action', {action_js});" if action else ""
+        cdata_attr = f"captchaDiv.setAttribute('data-cdata', {cdata_js});" if cdata else ""
+        action_option = f"action: {action_js}," if action else ""
+        cdata_option = f"cData: {cdata_js}," if cdata else ""
         script = f"""
+        window.__turnstileDiagnostics = {{
+            scriptLoaded: false,
+            rendered: false,
+            lastError: null
+        }};
+
         // Remove any existing turnstile widgets first
         document.querySelectorAll('.cf-turnstile').forEach(el => el.remove());
         document.querySelectorAll('[data-sitekey]').forEach(el => el.remove());
@@ -1040,10 +1084,10 @@ class TurnstileAPIServer:
         // Create turnstile widget directly on the page
         const captchaDiv = document.createElement('div');
         captchaDiv.className = 'cf-turnstile';
-        captchaDiv.setAttribute('data-sitekey', '{websiteKey}');
+        captchaDiv.setAttribute('data-sitekey', {sitekey_js});
         captchaDiv.setAttribute('data-callback', 'onTurnstileCallback');
-        {f'captchaDiv.setAttribute("data-action", "{action}");' if action else ''}
-        {f'captchaDiv.setAttribute("data-cdata", "{cdata}");' if cdata else ''}
+        {action_attr}
+        {cdata_attr}
         captchaDiv.style.position = 'fixed';
         captchaDiv.style.top = '20px';
         captchaDiv.style.left = '20px';
@@ -1064,16 +1108,18 @@ class TurnstileAPIServer:
             script.async = true;
             script.defer = true;
             script.onload = function() {{
+                window.__turnstileDiagnostics.scriptLoaded = true;
                 console.log('Turnstile script loaded');
                 // Wait a bit for script to initialize
                 setTimeout(() => {{
                     if (window.turnstile && window.turnstile.render) {{
                         try {{
                             window.turnstile.render(captchaDiv, {{
-                                sitekey: '{websiteKey}',
-                                {f'action: "{action}",' if action else ''}
-                                {f'cdata: "{cdata}",' if cdata else ''}
+                                sitekey: {sitekey_js},
+                                {action_option}
+                                {cdata_option}
                                 callback: function(token) {{
+                                    window.__turnstileDiagnostics.solved = true;
                                     console.log('Turnstile solved with token:', token);
                                     // Create hidden input for token
                                     let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
@@ -1086,18 +1132,23 @@ class TurnstileAPIServer:
                                     tokenInput.value = token;
                                 }},
                                 'error-callback': function(error) {{
+                                    window.__turnstileDiagnostics.lastError = String(error || 'unknown');
                                     console.log('Turnstile error:', error);
                                 }}
                             }});
+                            window.__turnstileDiagnostics.rendered = true;
                         }} catch (e) {{
+                            window.__turnstileDiagnostics.lastError = String(e && (e.stack || e.message) || e);
                             console.log('Turnstile render error:', e);
                         }}
                     }} else {{
+                        window.__turnstileDiagnostics.lastError = 'turnstile_api_not_available';
                         console.log('Turnstile API not available');
                     }}
                 }}, 1000);
             }};
             script.onerror = function() {{
+                window.__turnstileDiagnostics.lastError = 'failed_to_load_turnstile_script';
                 console.log('Failed to load Turnstile script');
             }};
             document.head.appendChild(script);
@@ -1108,10 +1159,11 @@ class TurnstileAPIServer:
             console.log('Turnstile already loaded, rendering immediately');
             try {{
                 window.turnstile.render(captchaDiv, {{
-                    sitekey: '{websiteKey}',
-                    {f'action: "{action}",' if action else ''}
-                    {f'cdata: "{cdata}",' if cdata else ''}
+                    sitekey: {sitekey_js},
+                    {action_option}
+                    {cdata_option}
                     callback: function(token) {{
+                        window.__turnstileDiagnostics.solved = true;
                         console.log('Turnstile solved with token:', token);
                         let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
                         if (!tokenInput) {{
@@ -1123,10 +1175,13 @@ class TurnstileAPIServer:
                         tokenInput.value = token;
                     }},
                     'error-callback': function(error) {{
+                        window.__turnstileDiagnostics.lastError = String(error || 'unknown');
                         console.log('Turnstile error:', error);
                     }}
                 }});
+                window.__turnstileDiagnostics.rendered = true;
             }} catch (e) {{
+                window.__turnstileDiagnostics.lastError = String(e && (e.stack || e.message) || e);
                 console.log('Immediate render error:', e);
                 loadTurnstile();
             }}
@@ -1318,6 +1373,11 @@ class TurnstileAPIServer:
                     context = await browser.new_context(no_viewport=True)
 
             page = await context.new_page()
+            if self.debug:
+                page.on(
+                    "console",
+                    lambda msg: logger.debug(f"Browser {index}: console[{msg.type}] {msg.text}")
+                )
 
             try:
                 await page.set_viewport_size({"width": 500, "height": 100})
@@ -1350,6 +1410,12 @@ class TurnstileAPIServer:
 
                 if self.debug:
                     logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
+
+                detected_params = await self._detect_turnstile_params(page, index)
+                if not action:
+                    action = detected_params.get("action") or action
+                if not cdata:
+                    cdata = detected_params.get("cdata") or cdata
 
                 await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
                 await asyncio.sleep(3)
@@ -1418,9 +1484,25 @@ class TurnstileAPIServer:
                         continue
 
                 elapsed_time = round(time.time() - start_time, 3)
-                await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": "timeout"})
+                diagnostics = {}
+                try:
+                    diagnostics = await page.evaluate("() => window.__turnstileDiagnostics || {}")
+                except Exception:
+                    diagnostics = {}
+                error_detail = "timeout"
+                if isinstance(diagnostics, dict) and diagnostics.get("lastError"):
+                    error_detail = f"timeout: {diagnostics.get('lastError')}"
+                await save_result(task_id, "turnstile", {
+                    "value": "CAPTCHA_FAIL",
+                    "elapsed_time": elapsed_time,
+                    "error": error_detail,
+                    "diagnostics": diagnostics if isinstance(diagnostics, dict) else {},
+                })
                 if self.debug:
-                    logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                    logger.error(
+                        f"Browser {index}: Error solving Turnstile in "
+                        f"{COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds: {error_detail}"
+                    )
             except Exception as e:
                 elapsed_time = round(time.time() - start_time, 3)
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(e)})
@@ -1565,11 +1647,15 @@ class TurnstileAPIServer:
             }
 
         if isinstance(result, dict) and result.get("value") == "CAPTCHA_FAIL":
-            return {
+            error_detail = str(result.get("error") or "Workers could not solve the Captcha")
+            response = {
                 "errorId": 1,
                 "errorCode": "ERROR_CAPTCHA_UNSOLVABLE",
-                "errorDescription": "Workers could not solve the Captcha"
+                "errorDescription": error_detail,
             }
+            if isinstance(result.get("diagnostics"), dict) and result.get("diagnostics"):
+                response["diagnostics"] = result["diagnostics"]
+            return response
 
         if isinstance(result, dict) and result.get("value") and result.get("value") != "CAPTCHA_FAIL":
             return {

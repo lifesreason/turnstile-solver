@@ -27,14 +27,14 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/*
 
 COPY requirements.txt .
-RUN set -eu; \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -eu; \
     pip_ok=0; \
     attempt=1; \
     for index_url in ${PIP_INDEX_URLS}; do \
       host="$(printf '%s' "${index_url}" | sed -E 's#^https?://([^/]+)/.*#\1#')"; \
       echo "pip install via ${index_url}" >&2; \
       if pip install \
-           --no-cache-dir \
            --retries 5 \
            --timeout 120 \
            --index-url "${index_url}" \

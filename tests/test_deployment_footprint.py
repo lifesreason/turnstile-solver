@@ -34,6 +34,7 @@ class DeploymentFootprintTest(unittest.TestCase):
         self.assertIn("ARG CAMOUFOX_BUILD=beta.28", dockerfile)
         self.assertIn("apt-get install -y --no-install-recommends aria2 ca-certificates", dockerfile)
         self.assertIn("PIP_INDEX_URLS", dockerfile)
+        self.assertIn("--mount=type=cache,target=/root/.cache/pip", dockerfile)
         self.assertIn("pypi.tuna.tsinghua.edu.cn/simple", dockerfile)
         self.assertIn("--index-url \"${index_url}\"", dockerfile)
         self.assertIn("--trusted-host \"${host}\"", dockerfile)
@@ -133,6 +134,16 @@ class DeploymentFootprintTest(unittest.TestCase):
         self.assertIn("--worker-task-json", solver)
         self.assertIn("WORKER_RESULT_PREFIX", solver)
         self.assertIn("_run_worker_from_args", solver)
+
+    def test_turnstile_render_uses_cdata_and_exposes_failure_detail(self):
+        solver = (ROOT / "api_solver.py").read_text()
+
+        self.assertIn("cData:", solver)
+        self.assertNotIn("cdata: {cdata_js}", solver)
+        self.assertIn("_detect_turnstile_params", solver)
+        self.assertIn("__turnstileDiagnostics", solver)
+        self.assertIn('errorDescription": error_detail', solver)
+        self.assertIn('response["diagnostics"]', solver)
 
 
 if __name__ == "__main__":
