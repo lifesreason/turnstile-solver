@@ -9,6 +9,7 @@ import json
 from typing import Optional, Union
 import argparse
 from quart import Quart, request, jsonify
+from camoufox import DefaultAddons
 from camoufox.async_api import AsyncCamoufox
 from db_results import init_db, save_result, load_result, cleanup_old_results
 from browser_configs import browser_config
@@ -310,7 +311,10 @@ class TurnstileAPIServer:
             playwright = await async_playwright().start()
             self._playwright = playwright
         elif self.browser_type == "camoufox":
-            camoufox = AsyncCamoufox(headless=self.headless)
+            camoufox = AsyncCamoufox(
+                headless=self.headless,
+                exclude_addons=[DefaultAddons.UBO],
+            )
             self._camoufox = camoufox
 
         browser_configs = []

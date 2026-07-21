@@ -90,6 +90,12 @@ class DeploymentFootprintTest(unittest.TestCase):
         self.assertIn('du -sm "${CAMOUFOX_DIR}"', entrypoint)
         self.assertIn("`TURNSTILE_KEEP_BROWSER_ALIVE` | `0`", readme)
 
+    def test_camoufox_does_not_require_default_addon_download(self):
+        solver = (ROOT / "api_solver.py").read_text()
+
+        self.assertIn("from camoufox import DefaultAddons", solver)
+        self.assertIn("exclude_addons=[DefaultAddons.UBO]", solver)
+
     def test_runtime_tracks_and_kills_browser_child_processes(self):
         solver = (ROOT / "api_solver.py").read_text()
 
