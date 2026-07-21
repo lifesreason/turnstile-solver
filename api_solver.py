@@ -82,10 +82,13 @@ class TurnstileAPIServer:
         # TURNSTILE_LAZY=1 (default) starts browsers on first solve request.
         # TURNSTILE_IDLE_SEC reclaims the pool after quiet period.
         # TURNSTILE_BROWSER_INSTANCES keeps process count below concurrency slots.
-        keep_alive_raw = (os.getenv("TURNSTILE_KEEP_BROWSER_ALIVE", "0") or "0").strip().lower()
+        keep_alive_raw = (os.getenv("TURNSTILE_KEEP_BROWSER_ALIVE", "1") or "1").strip().lower()
         self.keep_browser_alive = keep_alive_raw in ("1", "true", "yes", "on")
         low_resource_raw = (os.getenv("TURNSTILE_LOW_RESOURCE_MODE", "0") or "0").strip().lower()
         self.low_resource_mode = low_resource_raw not in ("0", "false", "no", "off")
+        self.camoufox_profile = (
+            os.getenv("TURNSTILE_CAMOUFOX_PROFILE", "compact") or "compact"
+        ).strip().lower()
         unblock_raw = (os.getenv("TURNSTILE_UNBLOCK_RENDERING", "0") or "0").strip().lower()
         self.unblock_rendering = unblock_raw in ("1", "true", "yes", "on")
         lazy_raw = (os.getenv("TURNSTILE_LAZY", "1") or "1").strip().lower()
@@ -104,14 +107,36 @@ class TurnstileAPIServer:
         self._last_used = 0.0
         self._idle_task: Optional[asyncio.Task] = None
         self._in_flight = 0
+        self._tasks_since_recycle = 0
         self._browser_pid_map: dict[int, set[int]] = {}
-        self.worker_mode = (os.getenv("TURNSTILE_WORKER_MODE", "process") or "process").strip().lower()
+        try:
+            self.browser_recycle_tasks = int(os.getenv("TURNSTILE_BROWSER_RECYCLE_TASKS", "100") or 100)
+        except (TypeError, ValueError):
+            self.browser_recycle_tasks = 100
+        if self.browser_recycle_tasks < 0:
+            self.browser_recycle_tasks = 0
+        self.worker_mode = (os.getenv("TURNSTILE_WORKER_MODE", "inline") or "inline").strip().lower()
+        if self.keep_browser_alive and self.worker_mode == "process":
+            logger.warning(
+                "Switching worker_mode from process to inline because "
+                "TURNSTILE_KEEP_BROWSER_ALIVE=1 requires a reusable in-process browser pool"
+            )
+            self.worker_mode = "inline"
         try:
             self.worker_timeout = float(os.getenv("TURNSTILE_WORKER_TIMEOUT", "120") or 120)
         except (TypeError, ValueError):
             self.worker_timeout = 120.0
         if self.worker_timeout <= 0:
             self.worker_timeout = 120.0
+        try:
+            self.solve_timeout_sec = float(os.getenv("TURNSTILE_SOLVE_TIMEOUT_SEC", "60") or 60)
+        except (TypeError, ValueError):
+            self.solve_timeout_sec = 60.0
+        if self.solve_timeout_sec <= 0:
+            self.solve_timeout_sec = 60.0
+        self._worker_tasks_queued = 0
+        self._worker_tasks_running = 0
+        self._worker_tasks_completed = 0
         self._worker_semaphore = asyncio.Semaphore(self.thread_count)
 
         # Initialize useragent and sec_ch_ua attributes
@@ -168,6 +193,9 @@ class TurnstileAPIServer:
                 command = prefix.split("(", 1)[1]
                 stat_parts = rest.split()
                 ppid = int(stat_parts[1])
+                cpu_ticks = 0
+                if len(stat_parts) > 12:
+                    cpu_ticks = int(stat_parts[11]) + int(stat_parts[12])
             except Exception:
                 continue
 
@@ -181,7 +209,13 @@ class TurnstileAPIServer:
             except Exception:
                 pass
 
-            processes[pid] = {"pid": pid, "ppid": ppid, "command": command, "rss_kb": rss_kb}
+            processes[pid] = {
+                "pid": pid,
+                "ppid": ppid,
+                "command": command,
+                "rss_kb": rss_kb,
+                "cpu_ticks": cpu_ticks,
+            }
 
         return processes
 
@@ -286,6 +320,10 @@ class TurnstileAPIServer:
                     f"browser_instances={self.browser_instance_count}, "
                     f"keep_alive={self.keep_browser_alive}, "
                     f"low_resource={self.low_resource_mode}, "
+                    f"camoufox_profile={self.camoufox_profile}, "
+                    f"worker_mode={self.worker_mode}, "
+                    f"recycle_tasks={self.browser_recycle_tasks}, "
+                    f"solve_timeout={self.solve_timeout_sec:.0f}s, "
                     f"idle_reclaim={self.idle_sec:.0f}s)"
                 )
                 if self.keep_browser_alive and self.idle_sec > 0:
@@ -314,7 +352,18 @@ class TurnstileAPIServer:
             playwright = await async_playwright().start()
             self._playwright = playwright
         elif self.browser_type == "camoufox":
-            camoufox = AsyncCamoufox(**self._camoufox_launch_options())
+            camoufox_options = self._camoufox_launch_options()
+            try:
+                camoufox = AsyncCamoufox(**camoufox_options)
+            except TypeError as e:
+                if "firefox_user_prefs" not in str(e):
+                    raise
+                logger.warning(
+                    "Camoufox rejected firefox_user_prefs; retrying without compact prefs"
+                )
+                camoufox_options = dict(camoufox_options)
+                camoufox_options.pop("firefox_user_prefs", None)
+                camoufox = AsyncCamoufox(**camoufox_options)
             self._camoufox = camoufox
 
         browser_configs = []
@@ -413,16 +462,53 @@ class TurnstileAPIServer:
             if self.browser_type == "camoufox":
                 logger.debug(f"Camoufox launch options: {self._camoufox_launch_options()}")
 
+    def _camoufox_user_prefs(self) -> dict:
+        profile = (self.camoufox_profile or "compact").strip().lower()
+        if profile in ("0", "off", "none", "false", "no"):
+            return {}
+
+        prefs = {
+            "browser.cache.disk.enable": False,
+            "browser.cache.memory.enable": False,
+            "browser.cache.offline.enable": False,
+            "browser.sessionhistory.max_total_viewers": 0,
+            "browser.sessionstore.max_tabs_undo": 0,
+            "browser.sessionstore.max_windows_undo": 0,
+            "media.peerconnection.enabled": False,
+            "network.dns.disablePrefetch": True,
+            "network.predictor.enabled": False,
+            "network.prefetch-next": False,
+        }
+
+        if profile == "compact":
+            prefs.update({
+                "dom.ipc.keepProcessesAlive.web": 1,
+                "dom.ipc.keepProcessesAlive.webIsolated.perOrigin": 0,
+                "dom.ipc.processCount": 1,
+                "dom.ipc.processCount.webIsolated": 1,
+                "fission.autostart": False,
+                "toolkit.telemetry.enabled": False,
+            })
+
+        return prefs
+
     def _camoufox_launch_options(self) -> dict:
+        profile_enabled = (self.camoufox_profile or "compact").strip().lower() not in (
+            "0", "off", "none", "false", "no"
+        )
         options = {
             "headless": self.headless,
+            "enable_cache": False,
             "exclude_addons": [DefaultAddons.UBO],
         }
-        if self.low_resource_mode:
+        if self.low_resource_mode or profile_enabled:
             options.update({
                 "block_webrtc": True,
                 "disable_coop": True,
             })
+        prefs = self._camoufox_user_prefs()
+        if prefs:
+            options["firefox_user_prefs"] = prefs
         return options
 
     def _camoufox_launch_options_summary(self) -> dict:
@@ -553,16 +639,25 @@ class TurnstileAPIServer:
         def rss_mb(pid_set: set[int]) -> float:
             return round(sum(processes.get(pid, {}).get("rss_kb", 0) for pid in pid_set) / 1024.0, 1)
 
+        def cpu_ticks(pid_set: set[int]) -> int:
+            return int(sum(processes.get(pid, {}).get("cpu_ticks", 0) for pid in pid_set))
+
         own_rss = round(processes.get(own_pid, {}).get("rss_kb", 0) / 1024.0, 1)
         return {
             "process_rss_mb": own_rss,
+            "process_cpu_ticks": int(processes.get(own_pid, {}).get("cpu_ticks", 0)),
+            "children_count": len(children),
             "children_rss_mb": rss_mb(children),
+            "children_cpu_ticks": cpu_ticks(children),
+            "browser_process_count": len(browser_pids),
             "browser_process_rss_mb": rss_mb(browser_pids),
+            "browser_cpu_ticks": cpu_ticks(browser_pids),
             "browser_processes": [
                 {
                     "pid": pid,
                     "command": processes.get(pid, {}).get("command", ""),
                     "rss_mb": round(processes.get(pid, {}).get("rss_kb", 0) / 1024.0, 1),
+                    "cpu_ticks": int(processes.get(pid, {}).get("cpu_ticks", 0)),
                 }
                 for pid in sorted(browser_pids)
             ],
@@ -644,19 +739,36 @@ class TurnstileAPIServer:
             self._in_flight = 0
 
         self._pool_ready = False
+        self._tasks_since_recycle = 0
         # Keep last_used as historical activity; do not bump it here or reclaim loops thrash.
         logger.info("Browser pool reclaimed (idle / rebuild)")
 
     async def _reclaim_after_task_if_needed(self) -> None:
         """Drop browser processes immediately in low-memory mode."""
-        if self.keep_browser_alive or self._in_flight > 0 or not self._pool_ready:
+        should_recycle = (
+            self.keep_browser_alive
+            and self.browser_recycle_tasks > 0
+            and self._tasks_since_recycle >= self.browser_recycle_tasks
+        )
+        if (self.keep_browser_alive and not should_recycle) or self._in_flight > 0 or not self._pool_ready:
             return
         if self._pool_lock is None:
             self._pool_lock = asyncio.Lock()
         async with self._pool_lock:
-            if self.keep_browser_alive or self._in_flight > 0 or not self._pool_ready:
+            should_recycle = (
+                self.keep_browser_alive
+                and self.browser_recycle_tasks > 0
+                and self._tasks_since_recycle >= self.browser_recycle_tasks
+            )
+            if (self.keep_browser_alive and not should_recycle) or self._in_flight > 0 or not self._pool_ready:
                 return
-            logger.info("Low-memory mode: reclaiming browser pool after task")
+            if should_recycle:
+                logger.info(
+                    f"Recycling browser pool after {self._tasks_since_recycle} tasks "
+                    f"(limit={self.browser_recycle_tasks})"
+                )
+            else:
+                logger.info("Low-memory mode: reclaiming browser pool after task")
             await self._shutdown_browsers()
 
     async def _run_worker_subprocess(
@@ -723,7 +835,12 @@ class TurnstileAPIServer:
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except Exception:
                 pass
-            return {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": "worker_timeout"}
+            return {
+                "value": "CAPTCHA_FAIL",
+                "elapsed_time": 0,
+                "error": "worker_timeout",
+                "resource_report": self._process_memory_report(),
+            }
 
         text = output.decode("utf-8", errors="replace")
         for line in reversed(text.splitlines()):
@@ -751,21 +868,33 @@ class TurnstileAPIServer:
         cdata: Optional[str] = None,
         proxy: Optional[str] = None,
     ) -> None:
-        async with self._worker_semaphore:
-            result = await self._run_worker_subprocess(
-                task_id=task_id,
-                url=url,
-                sitekey=sitekey,
-                action=action,
-                cdata=cdata,
-                proxy=proxy,
-            )
-            if isinstance(result, dict) and result.get("value") == "CAPTCHA_FAIL":
-                logger.error(
-                    f"Worker failed for task {task_id}: "
-                    f"{result.get('error') or 'unknown_error'}"
+        self._worker_tasks_queued += 1
+        entered_worker = False
+        try:
+            async with self._worker_semaphore:
+                self._worker_tasks_queued = max(0, self._worker_tasks_queued - 1)
+                self._worker_tasks_running += 1
+                entered_worker = True
+                result = await self._run_worker_subprocess(
+                    task_id=task_id,
+                    url=url,
+                    sitekey=sitekey,
+                    action=action,
+                    cdata=cdata,
+                    proxy=proxy,
                 )
-            await save_result(task_id, "turnstile", result)
+                if isinstance(result, dict) and result.get("value") == "CAPTCHA_FAIL":
+                    logger.error(
+                        f"Worker failed for task {task_id}: "
+                        f"{result.get('error') or 'unknown_error'}"
+                    )
+                await save_result(task_id, "turnstile", result)
+        finally:
+            if not entered_worker:
+                self._worker_tasks_queued = max(0, self._worker_tasks_queued - 1)
+            else:
+                self._worker_tasks_running = max(0, self._worker_tasks_running - 1)
+                self._worker_tasks_completed += 1
 
     async def _ensure_pool(self) -> None:
         """Make sure the browser pool is warm before solving."""
@@ -1449,8 +1578,17 @@ class TurnstileAPIServer:
                 max_attempts = 30
                 click_count = 0
                 max_clicks = 10
+                solve_wait_started = time.time()
+                deadline = solve_wait_started + self.solve_timeout_sec
 
                 for attempt in range(max_attempts):
+                    if time.time() >= deadline:
+                        if self.debug:
+                            logger.warning(
+                                f"Browser {index}: Solve timeout reached "
+                                f"({self.solve_timeout_sec:.0f}s)"
+                            )
+                        break
                     try:
                         try:
                             count = await locator.count()
@@ -1468,7 +1606,11 @@ class TurnstileAPIServer:
                                 if token:
                                     elapsed_time = round(time.time() - start_time, 3)
                                     logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                                    await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
+                                    await save_result(task_id, "turnstile", {
+                                        "value": token,
+                                        "elapsed_time": elapsed_time,
+                                        "resource_report": self._process_memory_report(),
+                                    })
                                     return
                             except Exception as e:
                                 if self.debug:
@@ -1482,7 +1624,11 @@ class TurnstileAPIServer:
                                     if element_token:
                                         elapsed_time = round(time.time() - start_time, 3)
                                         logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                                        await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
+                                        await save_result(task_id, "turnstile", {
+                                            "value": element_token,
+                                            "elapsed_time": elapsed_time,
+                                            "resource_report": self._process_memory_report(),
+                                        })
                                         return
                                 except Exception as e:
                                     if self.debug:
@@ -1517,11 +1663,14 @@ class TurnstileAPIServer:
                 error_detail = "timeout"
                 if isinstance(diagnostics, dict) and diagnostics.get("lastError"):
                     error_detail = f"timeout: {diagnostics.get('lastError')}"
+                elif time.time() >= deadline:
+                    error_detail = f"solve_timeout_after_{self.solve_timeout_sec:.0f}s"
                 await save_result(task_id, "turnstile", {
                     "value": "CAPTCHA_FAIL",
                     "elapsed_time": elapsed_time,
                     "error": error_detail,
                     "diagnostics": diagnostics if isinstance(diagnostics, dict) else {},
+                    "resource_report": self._process_memory_report(),
                 })
                 if self.debug:
                     logger.error(
@@ -1530,7 +1679,12 @@ class TurnstileAPIServer:
                     )
             except Exception as e:
                 elapsed_time = round(time.time() - start_time, 3)
-                await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(e)})
+                await save_result(task_id, "turnstile", {
+                    "value": "CAPTCHA_FAIL",
+                    "elapsed_time": elapsed_time,
+                    "error": str(e),
+                    "resource_report": self._process_memory_report(),
+                })
                 logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
             finally:
                 if self.debug:
@@ -1566,6 +1720,8 @@ class TurnstileAPIServer:
                         logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
         finally:
             # Always release in-flight even on early return / unexpected exception.
+            if browser is not None:
+                self._tasks_since_recycle += 1
             if self._in_flight > 0:
                 self._in_flight -= 1
             self._last_used = time.time()
@@ -1678,12 +1834,16 @@ class TurnstileAPIServer:
                 "errorCode": "ERROR_CAPTCHA_UNSOLVABLE",
                 "errorDescription": error_detail,
             }
+            if result.get("elapsed_time") is not None:
+                response["elapsedTime"] = result["elapsed_time"]
             if isinstance(result.get("diagnostics"), dict) and result.get("diagnostics"):
                 response["diagnostics"] = result["diagnostics"]
+            if isinstance(result.get("resource_report"), dict):
+                response["resourceReport"] = result["resource_report"]
             return response
 
         if isinstance(result, dict) and result.get("value") and result.get("value") != "CAPTCHA_FAIL":
-            return {
+            response = {
                 "errorId": 0,
                 "status": "ready",
                 "taskId": task_id,
@@ -1691,6 +1851,11 @@ class TurnstileAPIServer:
                     "token": result["value"]
                 }
             }
+            if result.get("elapsed_time") is not None:
+                response["elapsedTime"] = result["elapsed_time"]
+            if isinstance(result.get("resource_report"), dict):
+                response["resourceReport"] = result["resource_report"]
+            return response
 
         return {
             "errorId": 1,
@@ -1836,6 +2001,13 @@ class TurnstileAPIServer:
             "camoufox_launch_options": self._camoufox_launch_options_summary() if self.browser_type == "camoufox" else None,
             "worker_mode": self.worker_mode,
             "worker_timeout": self.worker_timeout,
+            "solve_timeout_sec": self.solve_timeout_sec,
+            "worker_capacity": self.thread_count,
+            "worker_queued": int(self._worker_tasks_queued or 0),
+            "worker_running": int(self._worker_tasks_running or 0),
+            "worker_completed": int(self._worker_tasks_completed or 0),
+            "browser_recycle_tasks": self.browser_recycle_tasks,
+            "tasks_since_recycle": self._tasks_since_recycle,
             "idle_sec": self.idle_sec,
             "pool_ready": bool(self._pool_ready),
             "thread": self.thread_count,
@@ -1869,6 +2041,7 @@ class TurnstileAPIServer:
             "browser_instances": self.browser_instance_count,
             "queue": self.browser_pool.qsize(),
             "in_flight": int(self._in_flight or 0),
+            "tasks_since_recycle": self._tasks_since_recycle,
         }), 200
 
     @staticmethod

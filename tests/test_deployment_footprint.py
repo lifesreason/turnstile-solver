@@ -75,10 +75,12 @@ class DeploymentFootprintTest(unittest.TestCase):
         self.assertIn('TURNSTILE_BROWSER_INSTANCES: "${TURNSTILE_BROWSER_INSTANCES:-1}"', compose)
         self.assertIn("`TURNSTILE_BROWSER_INSTANCES` | `1`", readme)
 
-    def test_runtime_defaults_to_no_warm_browser_pool(self):
+    def test_runtime_defaults_to_reused_idle_reclaimed_browser_pool(self):
         solver = (ROOT / "api_solver.py").read_text()
+        dockerfile = (ROOT / "Dockerfile").read_text()
         compose = (ROOT / "docker-compose.yml").read_text()
         entrypoint = (ROOT / "entrypoint.sh").read_text()
+        env_example = (ROOT / ".env.example").read_text()
         readme = (ROOT / "README.md").read_text()
 
         self.assertIn("TURNSTILE_KEEP_BROWSER_ALIVE", solver)
@@ -86,12 +88,21 @@ class DeploymentFootprintTest(unittest.TestCase):
         self.assertIn("TURNSTILE_LOW_RESOURCE_MODE", solver)
         self.assertIn("low_resource_mode", solver)
         self.assertIn("_reclaim_after_task_if_needed", solver)
-        self.assertIn('TURNSTILE_KEEP_BROWSER_ALIVE: "${TURNSTILE_KEEP_BROWSER_ALIVE:-0}"', compose)
+        self.assertIn("_tasks_since_recycle", solver)
+        self.assertIn("TURNSTILE_BROWSER_RECYCLE_TASKS", solver)
+        self.assertIn("browser_recycle_tasks", solver)
+        self.assertIn("TURNSTILE_KEEP_BROWSER_ALIVE=1", dockerfile)
+        self.assertIn("TURNSTILE_BROWSER_RECYCLE_TASKS=100", dockerfile)
+        self.assertIn('TURNSTILE_KEEP_BROWSER_ALIVE: "${TURNSTILE_KEEP_BROWSER_ALIVE:-1}"', compose)
+        self.assertIn('TURNSTILE_BROWSER_RECYCLE_TASKS: "${TURNSTILE_BROWSER_RECYCLE_TASKS:-100}"', compose)
         self.assertIn('TURNSTILE_LOW_RESOURCE_MODE: "${TURNSTILE_LOW_RESOURCE_MODE:-0}"', compose)
         self.assertNotIn("python -m camoufox fetch", entrypoint)
         self.assertIn("CAMOUFOX_MIN_CACHE_MB", entrypoint)
         self.assertIn('du -sm "${CAMOUFOX_DIR}"', entrypoint)
-        self.assertIn("`TURNSTILE_KEEP_BROWSER_ALIVE` | `0`", readme)
+        self.assertIn("TURNSTILE_KEEP_BROWSER_ALIVE=1", env_example)
+        self.assertIn("TURNSTILE_BROWSER_RECYCLE_TASKS=100", env_example)
+        self.assertIn("`TURNSTILE_KEEP_BROWSER_ALIVE` | `1`", readme)
+        self.assertIn("`TURNSTILE_BROWSER_RECYCLE_TASKS` | `100`", readme)
         self.assertIn("`TURNSTILE_LOW_RESOURCE_MODE` | `0`", readme)
 
     def test_camoufox_does_not_require_default_addon_download(self):
@@ -102,15 +113,33 @@ class DeploymentFootprintTest(unittest.TestCase):
 
     def test_camoufox_launch_defaults_are_lightweight(self):
         solver = (ROOT / "api_solver.py").read_text()
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        compose = (ROOT / "docker-compose.yml").read_text()
+        env_example = (ROOT / ".env.example").read_text()
+        readme = (ROOT / "README.md").read_text()
 
         self.assertIn("TURNSTILE_LOW_RESOURCE_MODE", solver)
         self.assertIn("self.low_resource_mode", solver)
+        self.assertIn("TURNSTILE_CAMOUFOX_PROFILE", solver)
+        self.assertIn("camoufox_profile", solver)
         self.assertIn("low_resource_mode", solver)
         self.assertIn('"camoufox_launch_options"', solver)
-        self.assertIn("low_resource=False", solver)
+        self.assertIn("low_resource={self.low_resource_mode}", solver)
         self.assertNotIn('"block_images": True', solver)
         self.assertIn('"block_webrtc": True', solver)
         self.assertIn('"disable_coop": True', solver)
+        self.assertIn('"enable_cache": False', solver)
+        self.assertIn('options["firefox_user_prefs"] = prefs', solver)
+        self.assertIn('"dom.ipc.processCount"', solver)
+        self.assertIn('"dom.ipc.processCount.webIsolated"', solver)
+        self.assertIn('"fission.autostart"', solver)
+        self.assertIn('"network.prefetch-next"', solver)
+        self.assertIn("Camoufox rejected firefox_user_prefs", solver)
+        self.assertIn('camoufox_options.pop("firefox_user_prefs", None)', solver)
+        self.assertIn("TURNSTILE_CAMOUFOX_PROFILE=compact", dockerfile)
+        self.assertIn('TURNSTILE_CAMOUFOX_PROFILE: "${TURNSTILE_CAMOUFOX_PROFILE:-compact}"', compose)
+        self.assertIn("TURNSTILE_CAMOUFOX_PROFILE=compact", env_example)
+        self.assertIn("`TURNSTILE_CAMOUFOX_PROFILE` | `compact`", readme)
 
     def test_runtime_tracks_and_kills_browser_child_processes(self):
         solver = (ROOT / "api_solver.py").read_text()
@@ -120,6 +149,29 @@ class DeploymentFootprintTest(unittest.TestCase):
         self.assertIn("_kill_browser_process_leftovers", solver)
         self.assertIn("_process_memory_report", solver)
         self.assertIn("browser_process_rss_mb", solver)
+        self.assertIn("browser_process_count", solver)
+        self.assertIn("children_count", solver)
+        self.assertIn("browser_cpu_ticks", solver)
+        self.assertIn("resource_report", solver)
+
+    def test_runtime_exposes_worker_queue_and_solve_timeout(self):
+        solver = (ROOT / "api_solver.py").read_text()
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        compose = (ROOT / "docker-compose.yml").read_text()
+        env_example = (ROOT / ".env.example").read_text()
+        readme = (ROOT / "README.md").read_text()
+
+        self.assertIn("TURNSTILE_SOLVE_TIMEOUT_SEC", solver)
+        self.assertIn("solve_timeout_sec", solver)
+        self.assertIn("_worker_tasks_queued", solver)
+        self.assertIn("_worker_tasks_running", solver)
+        self.assertIn('"worker_queued"', solver)
+        self.assertIn('"worker_running"', solver)
+        self.assertIn('"solve_timeout_sec"', solver)
+        self.assertIn("TURNSTILE_SOLVE_TIMEOUT_SEC=60", dockerfile)
+        self.assertIn('TURNSTILE_SOLVE_TIMEOUT_SEC: "${TURNSTILE_SOLVE_TIMEOUT_SEC:-60}"', compose)
+        self.assertIn("TURNSTILE_SOLVE_TIMEOUT_SEC=60", env_example)
+        self.assertIn("`TURNSTILE_SOLVE_TIMEOUT_SEC` | `60`", readme)
 
     def test_runtime_keeps_heavy_page_assets_blocked_by_default(self):
         solver = (ROOT / "api_solver.py").read_text()
@@ -131,7 +183,7 @@ class DeploymentFootprintTest(unittest.TestCase):
         self.assertIn('TURNSTILE_UNBLOCK_RENDERING: "${TURNSTILE_UNBLOCK_RENDERING:-0}"', compose)
         self.assertIn("`TURNSTILE_UNBLOCK_RENDERING` | `0`", readme)
 
-    def test_worker_process_mode_is_default(self):
+    def test_inline_worker_mode_is_default_for_camoufox_reuse(self):
         solver = (ROOT / "api_solver.py").read_text()
         dockerfile = (ROOT / "Dockerfile").read_text()
         compose = (ROOT / "docker-compose.yml").read_text()
@@ -140,13 +192,16 @@ class DeploymentFootprintTest(unittest.TestCase):
 
         self.assertIn("TURNSTILE_WORKER_MODE", solver)
         self.assertIn("worker_mode", solver)
-        self.assertIn("TURNSTILE_WORKER_MODE=process", dockerfile)
+        self.assertIn("keep_browser_alive and self.worker_mode == \"process\"", solver)
+        self.assertIn("Switching worker_mode from process to inline", solver)
+        self.assertIn("TURNSTILE_WORKER_MODE=inline", dockerfile)
         self.assertIn("TURNSTILE_WORKER_TIMEOUT=120", dockerfile)
-        self.assertIn('TURNSTILE_WORKER_MODE: "${TURNSTILE_WORKER_MODE:-process}"', compose)
+        self.assertIn("TURNSTILE_LOW_RESOURCE_MODE=0", dockerfile)
+        self.assertIn('TURNSTILE_WORKER_MODE: "${TURNSTILE_WORKER_MODE:-inline}"', compose)
         self.assertIn('TURNSTILE_WORKER_TIMEOUT: "${TURNSTILE_WORKER_TIMEOUT:-120}"', compose)
-        self.assertIn("TURNSTILE_WORKER_MODE=process", env_example)
+        self.assertIn("TURNSTILE_WORKER_MODE=inline", env_example)
         self.assertIn("TURNSTILE_WORKER_TIMEOUT=120", env_example)
-        self.assertIn("`TURNSTILE_WORKER_MODE` | `process`", readme)
+        self.assertIn("`TURNSTILE_WORKER_MODE` | `inline`", readme)
 
     def test_worker_subprocess_entrypoint_exists(self):
         solver = (ROOT / "api_solver.py").read_text()

@@ -2,13 +2,14 @@
 
 `turnstile-solver` 是一个可独立部署的 Cloudflare Turnstile 求解服务。本仓库把浏览器求解逻辑封装为 HTTP API，供其它业务服务通过网络调用，避免每个业务项目都内置一套浏览器和验证码处理流程。
 
-当前仓库重点面向 Docker / NAS / 服务器部署，并针对运行内存做了低资源默认配置：
+当前仓库重点面向 Docker / NAS / 服务器部署，并针对连续调用场景做了低资源复用配置：
 
 - 镜像内置 Camoufox 浏览器资产，容器启动不依赖运行时下载。
 - 服务启动后不立即启动浏览器，第一次收到解题任务时才懒加载。
 - 默认只启动 1 个真实浏览器进程。
-- 默认任务结束后立即关闭浏览器进程，降低调用后的常驻内存。
-- 默认每个解题任务由独立 worker 进程执行，浏览器内存不留在主 HTTP 服务进程里。
+- 默认在主服务进程内复用 Camoufox，减少连续调用时反复冷启动造成的 CPU 峰值。
+- 默认 60 秒没有新任务后释放浏览器，并在复用 100 个任务后强制回收一次。
+- 默认使用 Camoufox `compact` 资源档位，限制 Firefox 子进程并关闭 cache/prefetch。
 - 默认持续阻断图片、字体、样式等重页面资源，减少单次解题峰值。
 - `/health` 提供浏览器池、进程 RSS 和浏览器子进程诊断信息。
 
@@ -16,9 +17,9 @@
 
 ## 工作方式
 
-服务启动后只运行一个轻量 HTTP 进程。业务调用 `createTask` 或 `/turnstile` 后，主服务默认会启动一个短生命周期 worker 子进程，由 worker 启动 Camoufox 浏览器、打开目标页面、注入/定位 Turnstile 组件并等待 token。worker 将结果回传给主服务后退出，浏览器峰值内存被限制在 worker 生命周期内。
+服务启动后只运行一个轻量 HTTP 进程。业务调用 `createTask` 或 `/turnstile` 后，主服务默认懒加载 1 个 Camoufox 浏览器实例，打开目标页面、注入/定位 Turnstile 组件并等待 token。后续任务复用同一个浏览器池，避免连续调用时反复冷启动。
 
-如果设置 `TURNSTILE_WORKER_MODE=inline`，主服务会在自身进程里执行浏览器求解。这主要用于调试，不建议在低内存部署中使用。
+默认 `TURNSTILE_WORKER_MODE=inline` 适合持续调用。如果你更看重每个任务结束后主进程回到最低内存，可以设置 `TURNSTILE_KEEP_BROWSER_ALIVE=0` 且 `TURNSTILE_WORKER_MODE=process`，恢复每任务独立 worker 的隔离模式。
 
 Docker 镜像在构建阶段下载 Camoufox release zip，校验 zip 完整性，解压到 `/root/.cache/camoufox`，再把该目录复制进最终镜像。构建阶段使用可断点续传的下载方式，避免 GitHub 下载中断后只留下空缓存。容器启动时只做同样的完整性校验，不会再下载浏览器；如果资产缺失会直接退出并提示重新构建镜像。
 
@@ -223,11 +224,14 @@ socks5://127.0.0.1:7890
 | `TURNSTILE_BROWSER_TYPE` | `camoufox` | `camoufox` / `chromium` / `chrome` / `msedge` |
 | `TURNSTILE_DEBUG` | `0` | `1` 开启详细日志 |
 | `TURNSTILE_LAZY` | `1` | `1` 表示首次任务再启动浏览器 |
-| `TURNSTILE_KEEP_BROWSER_ALIVE` | `0` | `0` 表示任务完成后立即关闭浏览器；`1` 表示保温浏览器池 |
+| `TURNSTILE_KEEP_BROWSER_ALIVE` | `1` | `1` 表示复用浏览器池；`0` 表示任务完成后立即关闭浏览器 |
 | `TURNSTILE_LOW_RESOURCE_MODE` | `0` | `1` 表示 Camoufox 启用实验性低资源参数；默认关闭以保持兼容性 |
+| `TURNSTILE_CAMOUFOX_PROFILE` | `compact` | Camoufox 资源档位：`compact` / `balanced` / `off` |
 | `TURNSTILE_UNBLOCK_RENDERING` | `0` | `0` 表示持续阻断图片/字体/样式等重资源；兼容性问题可设 `1` |
-| `TURNSTILE_WORKER_MODE` | `process` | `process` 表示每个任务使用独立 worker 子进程；`inline` 表示在主服务进程内求解 |
+| `TURNSTILE_WORKER_MODE` | `inline` | `inline` 表示在主服务内复用浏览器；`process` 表示每个任务使用独立 worker 子进程 |
 | `TURNSTILE_WORKER_TIMEOUT` | `120` | worker 单任务超时秒数，超时后主服务会终止 worker 进程树 |
+| `TURNSTILE_SOLVE_TIMEOUT_SEC` | `60` | 浏览器内实际等待 Turnstile token 的最长秒数，用于缩短失败任务高资源占用时间 |
+| `TURNSTILE_BROWSER_RECYCLE_TASKS` | `100` | 常驻浏览器复用多少个任务后强制回收；`0` 表示不按任务数回收 |
 | `TURNSTILE_IDLE_SEC` | `60` | 保温模式下的空闲回收秒数；仅 `TURNSTILE_KEEP_BROWSER_ALIVE=1` 时有意义 |
 | `TURNSTILE_PROXY` | `0` | `1` 表示启用 `proxies.txt` 代理池 |
 | `TURNSTILE_SHM_SIZE` | `512mb` | Docker `/dev/shm` 大小；复杂页面或更高并发可设 `1gb` / `2gb` |
@@ -236,42 +240,49 @@ socks5://127.0.0.1:7890
 
 ## 资源模式
 
-### 低内存默认模式
+### 连续调用默认模式
 
-默认配置适合 NAS 或小内存服务器：
+默认配置适合持续调用同一个求解服务：
 
 ```env
 TURNSTILE_THREAD=1
 TURNSTILE_BROWSER_INSTANCES=1
-TURNSTILE_KEEP_BROWSER_ALIVE=0
+TURNSTILE_KEEP_BROWSER_ALIVE=1
 TURNSTILE_LOW_RESOURCE_MODE=0
+TURNSTILE_CAMOUFOX_PROFILE=compact
 TURNSTILE_UNBLOCK_RENDERING=0
-TURNSTILE_WORKER_MODE=process
+TURNSTILE_WORKER_MODE=inline
 TURNSTILE_WORKER_TIMEOUT=120
+TURNSTILE_SOLVE_TIMEOUT_SEC=60
+TURNSTILE_BROWSER_RECYCLE_TASKS=100
+TURNSTILE_IDLE_SEC=60
 TURNSTILE_SHM_SIZE=512mb
 ```
 
 特点：
 
-- 启动后常驻内存较低。
-- 每次任务会启动独立 worker，worker 内部启动浏览器，任务结束后 worker 退出。
-- Camoufox 默认不启用额外低资源参数；如果你想试验更激进的资源压缩，可以把 `TURNSTILE_LOW_RESOURCE_MODE=1` 打开。
-- 延迟比保温模式更高，但调用结束后不应长期保留浏览器进程。
+- 启动后仍然只跑轻量 HTTP 进程，首次任务才启动 Camoufox。
+- 连续调用时复用同一个 Camoufox，降低反复启动浏览器造成的 CPU 峰值。
+- 60 秒无新任务后自动释放浏览器。
+- 常驻浏览器每处理 100 个任务后强制回收一次，避免长期复用后内存膨胀。
+- `compact` 档会限制 Firefox 内容进程，关闭 cache/prefetch，但不会默认禁用图片加载。
+- 如果 Turnstile 长时间没有返回 token，`TURNSTILE_SOLVE_TIMEOUT_SEC` 会提前结束浏览器求解，避免失败任务持续占用高 CPU / 高内存。
+- 如果 compact 档影响通过率，先改成 `TURNSTILE_CAMOUFOX_PROFILE=balanced`；仍有问题再设 `off`。
 
-### 低延迟保温模式
+### 每任务隔离模式
 
-如果调用频繁，可以保留浏览器池：
+如果你更重视任务结束后立刻回到最低内存，可以切回每任务独立 worker：
 
 ```env
-TURNSTILE_KEEP_BROWSER_ALIVE=1
-TURNSTILE_IDLE_SEC=180
+TURNSTILE_KEEP_BROWSER_ALIVE=0
+TURNSTILE_WORKER_MODE=process
 ```
 
 特点：
 
-- 减少每次任务的浏览器冷启动时间。
-- 空闲期间浏览器仍会占用内存。
-- 到达 `TURNSTILE_IDLE_SEC` 后自动回收。
+- 每个任务启动独立 worker 和浏览器，结束后退出。
+- 调用结束后的常驻内存最低。
+- 连续调用时 CPU 更容易被浏览器冷启动打高。
 
 ### 更高并发
 
@@ -303,18 +314,38 @@ curl -s http://127.0.0.1:5072/health
 |------|------|
 | `process_rss_mb` | Python 主服务进程 RSS |
 | `children_rss_mb` | 当前服务子进程 RSS 总和 |
+| `children_count` | 当前服务子进程数量 |
 | `browser_process_rss_mb` | 浏览器相关子进程 RSS 总和 |
+| `browser_process_count` | 浏览器相关子进程数量 |
+| `browser_cpu_ticks` | 浏览器相关子进程累计 CPU ticks，用于判断任务期间 CPU 是否主要消耗在浏览器 |
 | `browser_processes` | 浏览器相关子进程列表 |
 | `pool_ready` | 浏览器池是否仍处于可用状态 |
 | `owned` | 当前服务持有的真实浏览器实例数量 |
 | `queue` | 当前可用并发槽位数量 |
 | `in_flight` | 当前正在处理的任务数量 |
+| `worker_queued` | process worker 模式下等待执行的任务数量 |
+| `worker_running` | process worker 模式下正在执行的任务数量 |
+| `worker_completed` | process worker 模式下已完成任务数量 |
+| `solve_timeout_sec` | 浏览器内求解阶段的超时秒数 |
+| `browser_recycle_tasks` | 常驻浏览器按任务数回收的阈值 |
+| `tasks_since_recycle` | 当前浏览器池已复用的任务数量 |
 
 判断方式：
 
 - `browser_process_rss_mb > 0`：还有浏览器进程在运行，可能是任务未结束、保温模式开启，或浏览器残留未清理。
+- `worker_mode = inline` 且 `in_flight <= 1` 但 Docker 面板仍到 1GB+：这是单个 Camoufox/Firefox 进程树的峰值，不是 process worker 叠加。
+- `worker_queued > 0`：调用方已经并行提交了多个任务；process 模式下会排队，不会同时启动多个 worker，但失败任务会拉长整体高资源窗口。
+- `tasks_since_recycle` 接近 `browser_recycle_tasks`：下一次任务结束后会回收并重建浏览器池。
 - `browser_process_rss_mb = 0` 但 Docker 面板仍显示高：更可能是容器 page cache 或面板统计口径，不是活跃浏览器进程 RSS。
 - `pool_ready = true` 且 `owned > 0`：浏览器池仍保温；确认是否设置了 `TURNSTILE_KEEP_BROWSER_ALIVE=1`。
+
+### 继续降低单任务峰值的路线
+
+如果确认 `worker_running = 1` 且 `browser_process_count` 只有一组浏览器进程，但峰值仍在 1GB 以上，说明主要开销来自 Camoufox/Firefox 本身。此时有三条路线：
+
+1. 保持 Camoufox：成功率相对稳，但只能通过更短超时、禁用保温、限制并发来降低总资源时间，单次峰值下降有限。
+2. 做 Chromium/Patchright A/B 测试：内存和 CPU 可能低一些，但 Turnstile 通过率需要用你的目标站点实测。默认 Docker 镜像为了控制体积没有打包 Patchright/Chromium；如果要走这条路，建议单独做一个 chromium flavor 镜像，而不是把两套浏览器都塞进默认镜像。
+3. 将解题浏览器外置：主服务只做队列和协议转换，浏览器运行在独立容器、远程浏览器服务或第三方验证码服务中，主服务内存可保持在 100MB 左右，但资源成本会转移到外部组件。
 
 手动回收：
 
@@ -352,10 +383,12 @@ docker compose config
 应看到类似：
 
 ```yaml
-TURNSTILE_KEEP_BROWSER_ALIVE: "0"
+TURNSTILE_KEEP_BROWSER_ALIVE: "1"
+TURNSTILE_CAMOUFOX_PROFILE: compact
 TURNSTILE_UNBLOCK_RENDERING: "0"
-TURNSTILE_WORKER_MODE: "process"
+TURNSTILE_WORKER_MODE: inline
 TURNSTILE_WORKER_TIMEOUT: "120"
+TURNSTILE_BROWSER_RECYCLE_TASKS: "100"
 TURNSTILE_BROWSER_INSTANCES: "1"
 TURNSTILE_THREAD: "1"
 shm_size: "536870912"
@@ -467,7 +500,7 @@ tests/                     部署配置和资源策略回归测试
 
 ### 为什么解题期间内存会升高？
 
-Turnstile 求解需要真实浏览器。即使默认只启动一个浏览器进程，打开目标页面和 Cloudflare challenge 时仍会有明显峰值。当前默认策略解决的是“任务结束后不长期常驻高内存”，不是把浏览器运行峰值降到普通 HTTP 服务水平。
+Turnstile 求解需要真实浏览器。当前默认使用 Camoufox compact 档、单浏览器实例、资源拦截和 60 秒 idle 回收来压低峰值和持续时间。连续调用时浏览器会常驻复用；如果 60 秒没有新调用，会自动释放。
 
 ### Docker 面板显示的内存和 `/health` 不一致怎么办？
 
