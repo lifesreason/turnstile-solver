@@ -8,6 +8,7 @@ PORT="${TURNSTILE_PORT:-5072}"
 THREAD="${TURNSTILE_THREAD:-1}"
 INSTANCES="${TURNSTILE_BROWSER_INSTANCES:-1}"
 BROWSER_TYPE="${TURNSTILE_BROWSER_TYPE:-camoufox}"
+KEEP_ALIVE="${TURNSTILE_KEEP_BROWSER_ALIVE:-0}"
 LOG_FILE="${TURNSTILE_LOG:-logs/turnstile_solver.log}"
 
 mkdir -p logs keys
@@ -35,7 +36,7 @@ fi
 pkill -f "api_solver.py --browser_type .* --port ${PORT}" 2>/dev/null || true
 sleep 1
 
-echo "[turnstile-solver] starting ${BROWSER_TYPE} concurrency_slots=${THREAD} browser_instances=${INSTANCES} ${HOST}:${PORT}"
+echo "[turnstile-solver] starting ${BROWSER_TYPE} concurrency_slots=${THREAD} browser_instances=${INSTANCES} keep_alive=${KEEP_ALIVE} ${HOST}:${PORT}"
 nohup .venv/bin/python api_solver.py \
   --browser_type "${BROWSER_TYPE}" \
   --thread "${THREAD}" \

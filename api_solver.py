@@ -5,6 +5,7 @@ import uuid
 import random
 import logging
 import asyncio
+import json
 from typing import Optional, Union
 import argparse
 from quart import Quart, request, jsonify
@@ -27,6 +28,8 @@ COLORS = {
     'RED': '\033[31m',
     'RESET': '\033[0m',
 }
+
+WORKER_RESULT_PREFIX = "__TURNSTILE_WORKER_RESULT__="
 
 
 class CustomLogger(logging.Logger):
@@ -78,12 +81,16 @@ class TurnstileAPIServer:
         # TURNSTILE_LAZY=1 (default) starts browsers on first solve request.
         # TURNSTILE_IDLE_SEC reclaims the pool after quiet period.
         # TURNSTILE_BROWSER_INSTANCES keeps process count below concurrency slots.
+        keep_alive_raw = (os.getenv("TURNSTILE_KEEP_BROWSER_ALIVE", "0") or "0").strip().lower()
+        self.keep_browser_alive = keep_alive_raw in ("1", "true", "yes", "on")
+        unblock_raw = (os.getenv("TURNSTILE_UNBLOCK_RENDERING", "0") or "0").strip().lower()
+        self.unblock_rendering = unblock_raw in ("1", "true", "yes", "on")
         lazy_raw = (os.getenv("TURNSTILE_LAZY", "1") or "1").strip().lower()
         self.lazy_browsers = lazy_raw not in ("0", "false", "no", "off")
         try:
-            self.idle_sec = float(os.getenv("TURNSTILE_IDLE_SEC", "180") or 180)
+            self.idle_sec = float(os.getenv("TURNSTILE_IDLE_SEC", "60") or 60)
         except (TypeError, ValueError):
-            self.idle_sec = 180.0
+            self.idle_sec = 60.0
         if self.idle_sec < 0:
             self.idle_sec = 0.0
         self._pool_ready = False
@@ -94,6 +101,15 @@ class TurnstileAPIServer:
         self._last_used = 0.0
         self._idle_task: Optional[asyncio.Task] = None
         self._in_flight = 0
+        self._browser_pid_map: dict[int, set[int]] = {}
+        self.worker_mode = (os.getenv("TURNSTILE_WORKER_MODE", "process") or "process").strip().lower()
+        try:
+            self.worker_timeout = float(os.getenv("TURNSTILE_WORKER_TIMEOUT", "120") or 120)
+        except (TypeError, ValueError):
+            self.worker_timeout = 120.0
+        if self.worker_timeout <= 0:
+            self.worker_timeout = 120.0
+        self._worker_semaphore = asyncio.Semaphore(self.thread_count)
 
         # Initialize useragent and sec_ch_ua attributes
         self.useragent = useragent
@@ -129,6 +145,82 @@ class TurnstileAPIServer:
         except (TypeError, ValueError):
             requested = 1
         return max(1, min(self.thread_count, requested))
+
+    def _read_process_table(self) -> dict[int, dict]:
+        """Read a small Linux /proc process table for cleanup and diagnostics."""
+        proc_root = "/proc"
+        processes: dict[int, dict] = {}
+        if not os.path.isdir(proc_root):
+            return processes
+
+        for name in os.listdir(proc_root):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            stat_path = os.path.join(proc_root, name, "stat")
+            status_path = os.path.join(proc_root, name, "status")
+            try:
+                stat = open(stat_path, encoding="utf-8").read()
+                prefix, rest = stat.rsplit(") ", 1)
+                command = prefix.split("(", 1)[1]
+                stat_parts = rest.split()
+                ppid = int(stat_parts[1])
+            except Exception:
+                continue
+
+            rss_kb = 0
+            try:
+                with open(status_path, encoding="utf-8") as status_file:
+                    for line in status_file:
+                        if line.startswith("VmRSS:"):
+                            rss_kb = int(line.split()[1])
+                            break
+            except Exception:
+                pass
+
+            processes[pid] = {"pid": pid, "ppid": ppid, "command": command, "rss_kb": rss_kb}
+
+        return processes
+
+    def _descendant_pids(self, root_pid: int | None = None, process_table: Optional[dict[int, dict]] = None) -> set[int]:
+        root_pid = int(root_pid or os.getpid())
+        processes = process_table if process_table is not None else self._read_process_table()
+        children_by_parent: dict[int, list[int]] = {}
+        for pid, info in processes.items():
+            children_by_parent.setdefault(int(info.get("ppid") or 0), []).append(pid)
+
+        descendants: set[int] = set()
+        stack = list(children_by_parent.get(root_pid, []))
+        while stack:
+            pid = stack.pop()
+            if pid in descendants:
+                continue
+            descendants.add(pid)
+            stack.extend(children_by_parent.get(pid, []))
+        return descendants
+
+    def _snapshot_child_pids(self) -> set[int]:
+        return self._descendant_pids(os.getpid())
+
+    def _browser_like_pids(self, process_table: Optional[dict[int, dict]] = None) -> set[int]:
+        processes = process_table if process_table is not None else self._read_process_table()
+        descendants = self._descendant_pids(os.getpid(), processes)
+        browser_names = ("camoufox", "firefox", "chromium", "chrome", "playwright")
+        return {
+            pid
+            for pid in descendants
+            if any(name in str(processes.get(pid, {}).get("command", "")).lower() for name in browser_names)
+        }
+
+    def _remember_browser_processes(self, browser, before_pids: set[int]) -> None:
+        after_pids = self._snapshot_child_pids()
+        browser_pids = set(after_pids - before_pids)
+        for attr in ("process", "_process"):
+            proc = getattr(browser, attr, None)
+            pid = getattr(proc, "pid", None)
+            if pid:
+                browser_pids.add(int(pid))
+        self._browser_pid_map[id(browser)] = browser_pids
 
     def display_welcome(self):
         """Displays welcome screen with logo."""
@@ -189,16 +281,17 @@ class TurnstileAPIServer:
                     f"Lazy browser mode ON — pool starts on first captcha "
                     f"(concurrency_slots={self.thread_count}, "
                     f"browser_instances={self.browser_instance_count}, "
+                    f"keep_alive={self.keep_browser_alive}, "
                     f"idle_reclaim={self.idle_sec:.0f}s)"
                 )
-                if self.idle_sec > 0:
+                if self.keep_browser_alive and self.idle_sec > 0:
                     self._idle_task = asyncio.create_task(self._idle_reaper())
             else:
                 logger.info("Starting browser initialization (eager)")
                 await self._initialize_browser()
                 self._pool_ready = True
                 self._last_used = time.time()
-                if self.idle_sec > 0:
+                if self.keep_browser_alive and self.idle_sec > 0:
                     self._idle_task = asyncio.create_task(self._idle_reaper())
         except Exception as e:
             logger.error(f"Failed to start turnstile solver: {str(e)}")
@@ -265,6 +358,7 @@ class TurnstileAPIServer:
             if config['useragent']:
                 browser_args.append(f"--user-agent={config['useragent']}")
 
+            before_pids = self._snapshot_child_pids()
             browser = None
             if self.browser_type in ['chromium', 'chrome', 'msedge'] and playwright:
                 browser = await playwright.chromium.launch(
@@ -276,6 +370,7 @@ class TurnstileAPIServer:
                 browser = await camoufox.start()
 
             if browser:
+                self._remember_browser_processes(browser, before_pids)
                 item = (i + 1, browser, config)
                 owned.append(item)
                 browsers.append(browser)
@@ -370,42 +465,83 @@ class TurnstileAPIServer:
                     logger.warning(f"{label}: {meth_name} failed: {e}")
         return False
 
-    def _kill_process_tree(self, proc) -> None:
-        """Force-kill a browser child process tree (Camoufox/Chromium leftovers)."""
-        if proc is None:
-            return
-        pid = getattr(proc, "pid", None)
+    def _kill_pid_tree(self, pid: int | None) -> None:
+        """Force-kill one process and its descendants without killing our group."""
         if not pid:
+            return
+        pid = int(pid)
+        if pid == os.getpid():
             return
         try:
             import signal
-            import os as _os
 
-            # Prefer process group kill when available.
-            try:
-                pgid = _os.getpgid(int(pid))
-                _os.killpg(pgid, signal.SIGTERM)
-            except Exception:
+            processes = self._read_process_table()
+            targets = self._descendant_pids(pid, processes)
+            targets.add(pid)
+            for target in sorted(targets, reverse=True):
+                if target == os.getpid():
+                    continue
                 try:
-                    _os.kill(int(pid), signal.SIGTERM)
+                    os.kill(target, signal.SIGTERM)
                 except Exception:
                     pass
-            try:
-                # Give it a moment, then hard kill.
-                time.sleep(0.05)
-                try:
-                    pgid = _os.getpgid(int(pid))
-                    _os.killpg(pgid, signal.SIGKILL)
-                except Exception:
+            time.sleep(0.2)
+            for target in sorted(targets, reverse=True):
+                if target == os.getpid():
+                    continue
+                if os.path.exists(f"/proc/{target}"):
                     try:
-                        _os.kill(int(pid), signal.SIGKILL)
+                        os.kill(target, signal.SIGKILL)
                     except Exception:
                         pass
-            except Exception:
-                pass
         except Exception as e:
             if self.debug:
-                logger.warning(f"kill process tree pid={pid} failed: {e}")
+                logger.warning(f"kill pid tree pid={pid} failed: {e}")
+
+    def _kill_process_tree(self, proc) -> None:
+        """Force-kill a browser child process tree (Camoufox/Chromium leftovers)."""
+        self._kill_pid_tree(getattr(proc, "pid", None))
+
+    def _kill_browser_process_leftovers(self) -> int:
+        """Kill tracked and browser-like descendants left after wrapper close()."""
+        pids: set[int] = set()
+        for tracked in self._browser_pid_map.values():
+            pids.update(tracked)
+        pids.update(self._browser_like_pids())
+
+        killed = 0
+        for pid in sorted(pids, reverse=True):
+            if pid == os.getpid():
+                continue
+            if os.path.exists(f"/proc/{pid}"):
+                self._kill_pid_tree(pid)
+                killed += 1
+        self._browser_pid_map.clear()
+        return killed
+
+    def _process_memory_report(self) -> dict:
+        processes = self._read_process_table()
+        own_pid = os.getpid()
+        children = self._descendant_pids(own_pid, processes)
+        browser_pids = self._browser_like_pids(processes)
+
+        def rss_mb(pid_set: set[int]) -> float:
+            return round(sum(processes.get(pid, {}).get("rss_kb", 0) for pid in pid_set) / 1024.0, 1)
+
+        own_rss = round(processes.get(own_pid, {}).get("rss_kb", 0) / 1024.0, 1)
+        return {
+            "process_rss_mb": own_rss,
+            "children_rss_mb": rss_mb(children),
+            "browser_process_rss_mb": rss_mb(browser_pids),
+            "browser_processes": [
+                {
+                    "pid": pid,
+                    "command": processes.get(pid, {}).get("command", ""),
+                    "rss_mb": round(processes.get(pid, {}).get("rss_kb", 0) / 1024.0, 1),
+                }
+                for pid in sorted(browser_pids)
+            ],
+        }
 
     async def _force_kill_browser(self, browser, index: int | None = None) -> None:
         """Hard cleanup for browsers that ignore close()/aclose()."""
@@ -418,6 +554,8 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.debug(f"{label}: force-killed via {attr}")
                 return
+        for pid in self._browser_pid_map.get(id(browser), set()):
+            self._kill_pid_tree(pid)
         # Nested browser objects (some wrappers)
         for attr in ("browser", "_browser", "impl_obj", "_impl_obj"):
             nested = getattr(browser, attr, None)
@@ -468,6 +606,10 @@ class TurnstileAPIServer:
             )
             self._camoufox = None
 
+        killed_leftovers = self._kill_browser_process_leftovers()
+        if killed_leftovers:
+            logger.warning(f"Force-killed {killed_leftovers} leftover browser process trees")
+
         # Idle reclaim must not keep a stuck counter forever.
         # If a solve task crashed without finally, _in_flight could block all future reclaim.
         if self._in_flight != 0:
@@ -479,6 +621,121 @@ class TurnstileAPIServer:
         self._pool_ready = False
         # Keep last_used as historical activity; do not bump it here or reclaim loops thrash.
         logger.info("Browser pool reclaimed (idle / rebuild)")
+
+    async def _reclaim_after_task_if_needed(self) -> None:
+        """Drop browser processes immediately in low-memory mode."""
+        if self.keep_browser_alive or self._in_flight > 0 or not self._pool_ready:
+            return
+        if self._pool_lock is None:
+            self._pool_lock = asyncio.Lock()
+        async with self._pool_lock:
+            if self.keep_browser_alive or self._in_flight > 0 or not self._pool_ready:
+                return
+            logger.info("Low-memory mode: reclaiming browser pool after task")
+            await self._shutdown_browsers()
+
+    async def _run_worker_subprocess(
+        self,
+        task_id: str,
+        url: str,
+        sitekey: str,
+        action: Optional[str] = None,
+        cdata: Optional[str] = None,
+        proxy: Optional[str] = None,
+    ) -> dict:
+        task_payload = {
+            "task_id": task_id,
+            "url": url,
+            "sitekey": sitekey,
+            "action": action,
+            "cdata": cdata,
+            "proxy": proxy,
+        }
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--worker-task-json",
+            json.dumps(task_payload, separators=(",", ":")),
+            "--browser_type",
+            self.browser_type,
+            "--thread",
+            "1",
+        ]
+        if not self.headless:
+            cmd.append("--no-headless")
+        if self.debug:
+            cmd.append("--debug")
+        if self.proxy_support:
+            cmd.append("--proxy")
+        if self.use_random_config:
+            cmd.append("--random")
+        if self.browser_name:
+            cmd.extend(["--browser", self.browser_name])
+        if self.browser_version:
+            cmd.extend(["--version", self.browser_version])
+
+        env = os.environ.copy()
+        env["TURNSTILE_WORKER_MODE"] = "inline"
+        env["TURNSTILE_KEEP_BROWSER_ALIVE"] = "0"
+        env["TURNSTILE_LAZY"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+        output = b""
+        try:
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=self.worker_timeout)
+            output = stdout or b""
+        except asyncio.TimeoutError:
+            logger.error(f"Worker timed out after {self.worker_timeout:.0f}s for task {task_id}")
+            self._kill_pid_tree(proc.pid)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            return {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": "worker_timeout"}
+
+        text = output.decode("utf-8", errors="replace")
+        for line in reversed(text.splitlines()):
+            if line.startswith(WORKER_RESULT_PREFIX):
+                try:
+                    result = json.loads(line[len(WORKER_RESULT_PREFIX):])
+                    if isinstance(result, dict):
+                        return result
+                except Exception as e:
+                    return {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": f"worker_result_parse_error: {e}"}
+
+        tail = "\n".join(text.splitlines()[-20:])
+        return {
+            "value": "CAPTCHA_FAIL",
+            "elapsed_time": 0,
+            "error": f"worker_missing_result exit={proc.returncode}: {tail}",
+        }
+
+    async def _solve_turnstile_in_worker(
+        self,
+        task_id: str,
+        url: str,
+        sitekey: str,
+        action: Optional[str] = None,
+        cdata: Optional[str] = None,
+        proxy: Optional[str] = None,
+    ) -> None:
+        async with self._worker_semaphore:
+            result = await self._run_worker_subprocess(
+                task_id=task_id,
+                url=url,
+                sitekey=sitekey,
+                action=action,
+                cdata=cdata,
+                proxy=proxy,
+            )
+            await save_result(task_id, "turnstile", result)
 
     async def _ensure_pool(self) -> None:
         """Make sure the browser pool is warm before solving."""
@@ -1088,7 +1345,8 @@ class TurnstileAPIServer:
                     logger.debug(f"Browser {index}: Loading real website directly: {url}")
 
                 await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-                await self._unblock_rendering(page)
+                if self.unblock_rendering:
+                    await self._unblock_rendering(page)
 
                 if self.debug:
                     logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
@@ -1204,6 +1462,7 @@ class TurnstileAPIServer:
             if self._in_flight > 0:
                 self._in_flight -= 1
             self._last_used = time.time()
+            await self._reclaim_after_task_if_needed()
 
 
 
@@ -1251,16 +1510,28 @@ class TurnstileAPIServer:
         })
 
         try:
-            asyncio.create_task(
-                self._solve_turnstile(
-                    task_id=task_id,
-                    url=url,
-                    sitekey=sitekey,
-                    action=action,
-                    cdata=cdata,
-                    proxy=proxy,
+            if self.worker_mode == "process":
+                asyncio.create_task(
+                    self._solve_turnstile_in_worker(
+                        task_id=task_id,
+                        url=url,
+                        sitekey=sitekey,
+                        action=action,
+                        cdata=cdata,
+                        proxy=proxy,
+                    )
                 )
-            )
+            else:
+                asyncio.create_task(
+                    self._solve_turnstile(
+                        task_id=task_id,
+                        url=url,
+                        sitekey=sitekey,
+                        action=action,
+                        cdata=cdata,
+                        proxy=proxy,
+                    )
+                )
             if self.debug:
                 logger.debug(
                     f"Request completed with taskid {task_id}"
@@ -1448,6 +1719,10 @@ class TurnstileAPIServer:
         return jsonify({
             "ok": True,
             "lazy": bool(self.lazy_browsers),
+            "keep_browser_alive": bool(self.keep_browser_alive),
+            "unblock_rendering": bool(self.unblock_rendering),
+            "worker_mode": self.worker_mode,
+            "worker_timeout": self.worker_timeout,
             "idle_sec": self.idle_sec,
             "pool_ready": bool(self._pool_ready),
             "thread": self.thread_count,
@@ -1458,6 +1733,7 @@ class TurnstileAPIServer:
             "owned": len(self._owned_browsers or []),
             "in_flight": int(self._in_flight or 0),
             "idle_for_sec": idle_for,
+            **self._process_memory_report(),
         }), 200
 
     async def reclaim(self):
@@ -1571,6 +1847,7 @@ def parse_args():
     parser.add_argument('--version', type=str, help='Specify browser version to use (e.g., 139, 141)')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Specify the IP address where the API solver runs. (Default: 127.0.0.1)')
     parser.add_argument('--port', type=str, default='5072', help='Set the port for the API solver to listen on. (Default: 5072)')
+    parser.add_argument('--worker-task-json', type=str, help='Run one solve task as a worker and print the result JSON.')
     return parser.parse_args()
 
 
@@ -1579,8 +1856,60 @@ def create_app(headless: bool, useragent: str, debug: bool, browser_type: str, t
     return server.app
 
 
+async def _run_worker_from_args(args) -> int:
+    try:
+        task = json.loads(args.worker_task_json or "{}")
+    except Exception as e:
+        print(WORKER_RESULT_PREFIX + json.dumps({
+            "value": "CAPTCHA_FAIL",
+            "elapsed_time": 0,
+            "error": f"invalid_worker_task_json: {e}",
+        }, separators=(",", ":")))
+        return 2
+
+    task_id = str(task.get("task_id") or uuid.uuid4())
+    server = TurnstileAPIServer(
+        headless=not args.no_headless,
+        debug=args.debug,
+        useragent=args.useragent,
+        browser_type=args.browser_type,
+        thread=1,
+        proxy_support=args.proxy,
+        use_random_config=args.random,
+        browser_name=args.browser,
+        browser_version=args.version,
+    )
+
+    try:
+        await server._solve_turnstile(
+            task_id=task_id,
+            url=str(task.get("url") or ""),
+            sitekey=str(task.get("sitekey") or ""),
+            action=task.get("action"),
+            cdata=task.get("cdata"),
+            proxy=task.get("proxy"),
+        )
+        result = await load_result(task_id)
+        if not isinstance(result, dict):
+            result = {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": "worker_result_not_found"}
+    except Exception as e:
+        result = {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": str(e)}
+    finally:
+        try:
+            await server._shutdown_browsers()
+        except Exception as e:
+            if isinstance(result, dict):
+                result["cleanup_warning"] = f"worker_cleanup_failed: {e}"
+
+    print(WORKER_RESULT_PREFIX + json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
 if __name__ == '__main__':
     args = parse_args()
+    if args.worker_task_json:
+        raise SystemExit(asyncio.run(_run_worker_from_args(args)))
+
     browser_types = [
         'chromium',
         'chrome',

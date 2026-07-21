@@ -13,17 +13,10 @@ WORKDIR /build
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --prefix=/opt/python -r requirements.txt \
-    && python -m camoufox fetch \
-    && if [ -d /root/.local/share/camoufox ]; then \
-        find /root/.local/share/camoufox -type d \( -name "test*" -o -name "tests" -o -name "mdns" -o -name "gtest" \) -exec rm -rf {} + 2>/dev/null || true; \
-        find /root/.local/share/camoufox -name "*.txt" -path "*/test*" -delete 2>/dev/null || true; \
-        find /root/.local/share/camoufox -name "*.json" -size -10k -delete 2>/dev/null || true; \
-        find /root/.local/share/camoufox -name "*.dummy" -delete 2>/dev/null || true; \
-    fi \
     && find /opt/python -depth -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null \
     && find /opt/python -name "*.pyc" -delete \
     && find /opt/python -name "*.pyo" -delete \
-    && rm -rf /root/.cache /tmp/*
+    && rm -rf /tmp/*
 
 FROM python:3.12-slim-bookworm AS runtime
 
@@ -39,6 +32,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TURNSTILE_BROWSER_TYPE=camoufox \
     TURNSTILE_DEBUG=0 \
     TURNSTILE_LAZY=1 \
+    TURNSTILE_KEEP_BROWSER_ALIVE=0 \
+    TURNSTILE_UNBLOCK_RENDERING=0 \
+    TURNSTILE_WORKER_MODE=process \
+    TURNSTILE_WORKER_TIMEOUT=120 \
     TURNSTILE_IDLE_SEC=60 \
     DEBIAN_FRONTEND=noninteractive
 
@@ -70,10 +67,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxshmfence1 \
         libxss1 \
         libxtst6 \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /root/.cache /tmp/*
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/*
 
 COPY --from=python-deps /opt/python /opt/python
-COPY --from=python-deps /root/.local/share/camoufox /root/.local/share/camoufox
 COPY api_solver.py browser_configs.py db_results.py /app/
 COPY entrypoint.sh /app/entrypoint.sh
 
@@ -82,7 +78,7 @@ RUN chmod +x /app/entrypoint.sh \
     && find /usr/local/lib -depth -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null \
     && find /usr/local/lib -name "*.pyc" -delete \
     && find /usr/local/lib -name "*.pyo" -delete \
-    && rm -rf /root/.cache /tmp/*
+    && rm -rf /tmp/*
 
 EXPOSE 5072
 
