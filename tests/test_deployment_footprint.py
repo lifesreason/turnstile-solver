@@ -21,18 +21,47 @@ class DeploymentFootprintTest(unittest.TestCase):
         size_mb = size * 1024 if unit == "g" else size
         self.assertLessEqual(size_mb, 512)
 
-    def test_dockerfile_uses_slim_runtime_stage(self):
+    def test_dockerfile_bundles_camoufox_assets(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
 
         self.assertIn("FROM python:3.12-slim-bookworm AS python-deps", dockerfile)
         self.assertIn("FROM python:3.12-slim-bookworm AS runtime", dockerfile)
         self.assertIn("COPY --from=python-deps /opt/python /opt/python", dockerfile)
-        self.assertNotIn("python -m camoufox fetch", dockerfile)
-        self.assertNotIn("COPY --from=python-deps /root/.local/share/camoufox", dockerfile)
+        self.assertIn("ARG TARGETARCH", dockerfile)
+        self.assertIn("ARG CAMOUFOX_FETCH_RETRIES=8", dockerfile)
+        self.assertIn("ARG CAMOUFOX_MIN_CACHE_MB=500", dockerfile)
+        self.assertIn("ARG CAMOUFOX_VERSION=152.0.4", dockerfile)
+        self.assertIn("ARG CAMOUFOX_BUILD=beta.28", dockerfile)
+        self.assertIn("apt-get install -y --no-install-recommends aria2 ca-certificates", dockerfile)
+        self.assertIn("PIP_INDEX_URLS", dockerfile)
+        self.assertIn("pypi.tuna.tsinghua.edu.cn/simple", dockerfile)
+        self.assertIn("--index-url \"${index_url}\"", dockerfile)
+        self.assertIn("--trusted-host \"${host}\"", dockerfile)
+        self.assertIn("--prefix=/opt/python", dockerfile)
+        self.assertIn("pip install attempt ${attempt} failed on ${index_url}; trying next index", dockerfile)
+        self.assertIn("pip install failed on all configured indexes", dockerfile)
+        self.assertIn("aria2c", dockerfile)
+        self.assertIn("--continue=true", dockerfile)
+        self.assertIn("python -m zipfile -t", dockerfile)
+        self.assertIn("python -m zipfile -e", dockerfile)
+        self.assertIn("browsers/${CAMOUFOX_REPO_NAME}/${full_version}", dockerfile)
+        self.assertIn('"active_version": rel', dockerfile)
+        self.assertIn("COPY --from=python-deps /root/.cache/camoufox", dockerfile)
+        self.assertIn('while [ "$attempt" -le "$CAMOUFOX_FETCH_RETRIES" ]', dockerfile)
+        self.assertIn('du -sm "${install_root}"', dockerfile)
+        self.assertIn('"$CAMOUFOX_MIN_CACHE_MB"', dockerfile)
+        self.assertIn("Camoufox assets were not bundled", dockerfile)
         self.assertNotIn("curl -fsS", dockerfile)
+        self.assertNotIn("python -m camoufox fetch", dockerfile)
         self.assertIn("urllib.request", dockerfile)
-        self.assertNotIn("rm -rf /root/.cache", dockerfile)
+        self.assertNotIn("rm -rf /root/.cache \\", dockerfile)
         self.assertIn("rm -rf /tmp/*", dockerfile)
+
+    def test_compose_does_not_hide_bundled_camoufox_assets(self):
+        compose = (ROOT / "docker-compose.yml").read_text()
+
+        self.assertNotIn("/root/.cache/camoufox", compose)
+        self.assertNotIn("camoufox-data", compose)
 
     def test_runtime_decouples_concurrency_from_browser_instances(self):
         solver = (ROOT / "api_solver.py").read_text()
@@ -55,7 +84,9 @@ class DeploymentFootprintTest(unittest.TestCase):
         self.assertIn("keep_browser_alive", solver)
         self.assertIn("_reclaim_after_task_if_needed", solver)
         self.assertIn('TURNSTILE_KEEP_BROWSER_ALIVE: "${TURNSTILE_KEEP_BROWSER_ALIVE:-0}"', compose)
-        self.assertIn("python -m camoufox fetch", entrypoint)
+        self.assertNotIn("python -m camoufox fetch", entrypoint)
+        self.assertIn("CAMOUFOX_MIN_CACHE_MB", entrypoint)
+        self.assertIn('du -sm "${CAMOUFOX_DIR}"', entrypoint)
         self.assertIn("`TURNSTILE_KEEP_BROWSER_ALIVE` | `0`", readme)
 
     def test_runtime_tracks_and_kills_browser_child_processes(self):
