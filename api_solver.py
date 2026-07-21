@@ -84,6 +84,8 @@ class TurnstileAPIServer:
         # TURNSTILE_BROWSER_INSTANCES keeps process count below concurrency slots.
         keep_alive_raw = (os.getenv("TURNSTILE_KEEP_BROWSER_ALIVE", "0") or "0").strip().lower()
         self.keep_browser_alive = keep_alive_raw in ("1", "true", "yes", "on")
+        low_resource_raw = (os.getenv("TURNSTILE_LOW_RESOURCE_MODE", "1") or "1").strip().lower()
+        self.low_resource_mode = low_resource_raw not in ("0", "false", "no", "off")
         unblock_raw = (os.getenv("TURNSTILE_UNBLOCK_RENDERING", "0") or "0").strip().lower()
         self.unblock_rendering = unblock_raw in ("1", "true", "yes", "on")
         lazy_raw = (os.getenv("TURNSTILE_LAZY", "1") or "1").strip().lower()
@@ -311,10 +313,7 @@ class TurnstileAPIServer:
             playwright = await async_playwright().start()
             self._playwright = playwright
         elif self.browser_type == "camoufox":
-            camoufox = AsyncCamoufox(
-                headless=self.headless,
-                exclude_addons=[DefaultAddons.UBO],
-            )
+            camoufox = AsyncCamoufox(**self._camoufox_launch_options())
             self._camoufox = camoufox
 
         browser_configs = []
@@ -410,6 +409,19 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser slot {i+1} config: {config['browser_name']} {config['browser_version']}")
                 logger.debug(f"Browser slot {i+1} User-Agent: {config['useragent']}")
                 logger.debug(f"Browser slot {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
+
+    def _camoufox_launch_options(self) -> dict:
+        options = {
+            "headless": self.headless,
+            "exclude_addons": [DefaultAddons.UBO],
+        }
+        if self.low_resource_mode:
+            options.update({
+                "block_images": True,
+                "block_webrtc": True,
+                "disable_coop": True,
+            })
+        return options
 
     async def _drain_pool_discard(self) -> None:
         """Empty the asyncio queue without closing browsers (caller closes)."""
@@ -1810,6 +1822,7 @@ class TurnstileAPIServer:
             "ok": True,
             "lazy": bool(self.lazy_browsers),
             "keep_browser_alive": bool(self.keep_browser_alive),
+            "low_resource_mode": bool(self.low_resource_mode),
             "unblock_rendering": bool(self.unblock_rendering),
             "worker_mode": self.worker_mode,
             "worker_timeout": self.worker_timeout,

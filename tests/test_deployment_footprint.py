@@ -83,18 +83,32 @@ class DeploymentFootprintTest(unittest.TestCase):
 
         self.assertIn("TURNSTILE_KEEP_BROWSER_ALIVE", solver)
         self.assertIn("keep_browser_alive", solver)
+        self.assertIn("TURNSTILE_LOW_RESOURCE_MODE", solver)
+        self.assertIn("low_resource_mode", solver)
         self.assertIn("_reclaim_after_task_if_needed", solver)
         self.assertIn('TURNSTILE_KEEP_BROWSER_ALIVE: "${TURNSTILE_KEEP_BROWSER_ALIVE:-0}"', compose)
+        self.assertIn('TURNSTILE_LOW_RESOURCE_MODE: "${TURNSTILE_LOW_RESOURCE_MODE:-1}"', compose)
         self.assertNotIn("python -m camoufox fetch", entrypoint)
         self.assertIn("CAMOUFOX_MIN_CACHE_MB", entrypoint)
         self.assertIn('du -sm "${CAMOUFOX_DIR}"', entrypoint)
         self.assertIn("`TURNSTILE_KEEP_BROWSER_ALIVE` | `0`", readme)
+        self.assertIn("`TURNSTILE_LOW_RESOURCE_MODE` | `1`", readme)
 
     def test_camoufox_does_not_require_default_addon_download(self):
         solver = (ROOT / "api_solver.py").read_text()
 
         self.assertIn("from camoufox import DefaultAddons", solver)
-        self.assertIn("exclude_addons=[DefaultAddons.UBO]", solver)
+        self.assertIn('"exclude_addons": [DefaultAddons.UBO]', solver)
+
+    def test_camoufox_launch_defaults_are_lightweight(self):
+        solver = (ROOT / "api_solver.py").read_text()
+
+        self.assertIn("TURNSTILE_LOW_RESOURCE_MODE", solver)
+        self.assertIn("self.low_resource_mode", solver)
+        self.assertIn("low_resource_mode", solver)
+        self.assertIn('"block_images": True', solver)
+        self.assertIn('"block_webrtc": True', solver)
+        self.assertIn('"disable_coop": True', solver)
 
     def test_runtime_tracks_and_kills_browser_child_processes(self):
         solver = (ROOT / "api_solver.py").read_text()
