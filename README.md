@@ -224,7 +224,7 @@ socks5://127.0.0.1:7890
 | `TURNSTILE_DEBUG` | `0` | `1` 开启详细日志 |
 | `TURNSTILE_LAZY` | `1` | `1` 表示首次任务再启动浏览器 |
 | `TURNSTILE_KEEP_BROWSER_ALIVE` | `0` | `0` 表示任务完成后立即关闭浏览器；`1` 表示保温浏览器池 |
-| `TURNSTILE_LOW_RESOURCE_MODE` | `1` | `1` 表示 Camoufox 启用低资源启动参数；兼容性问题可设 `0` |
+| `TURNSTILE_LOW_RESOURCE_MODE` | `0` | `1` 表示 Camoufox 启用实验性低资源参数；默认关闭以保持兼容性 |
 | `TURNSTILE_UNBLOCK_RENDERING` | `0` | `0` 表示持续阻断图片/字体/样式等重资源；兼容性问题可设 `1` |
 | `TURNSTILE_WORKER_MODE` | `process` | `process` 表示每个任务使用独立 worker 子进程；`inline` 表示在主服务进程内求解 |
 | `TURNSTILE_WORKER_TIMEOUT` | `120` | worker 单任务超时秒数，超时后主服务会终止 worker 进程树 |
@@ -244,7 +244,7 @@ socks5://127.0.0.1:7890
 TURNSTILE_THREAD=1
 TURNSTILE_BROWSER_INSTANCES=1
 TURNSTILE_KEEP_BROWSER_ALIVE=0
-TURNSTILE_LOW_RESOURCE_MODE=1
+TURNSTILE_LOW_RESOURCE_MODE=0
 TURNSTILE_UNBLOCK_RENDERING=0
 TURNSTILE_WORKER_MODE=process
 TURNSTILE_WORKER_TIMEOUT=120
@@ -255,7 +255,7 @@ TURNSTILE_SHM_SIZE=512mb
 
 - 启动后常驻内存较低。
 - 每次任务会启动独立 worker，worker 内部启动浏览器，任务结束后 worker 退出。
-- Camoufox 默认禁用图片加载、WebRTC 和 COOP 隔离，减少单次任务峰值资源占用。
+- Camoufox 默认不启用额外低资源参数；如果你想试验更激进的资源压缩，可以把 `TURNSTILE_LOW_RESOURCE_MODE=1` 打开。
 - 延迟比保温模式更高，但调用结束后不应长期保留浏览器进程。
 
 ### 低延迟保温模式

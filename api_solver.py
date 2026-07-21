@@ -84,7 +84,7 @@ class TurnstileAPIServer:
         # TURNSTILE_BROWSER_INSTANCES keeps process count below concurrency slots.
         keep_alive_raw = (os.getenv("TURNSTILE_KEEP_BROWSER_ALIVE", "0") or "0").strip().lower()
         self.keep_browser_alive = keep_alive_raw in ("1", "true", "yes", "on")
-        low_resource_raw = (os.getenv("TURNSTILE_LOW_RESOURCE_MODE", "1") or "1").strip().lower()
+        low_resource_raw = (os.getenv("TURNSTILE_LOW_RESOURCE_MODE", "0") or "0").strip().lower()
         self.low_resource_mode = low_resource_raw not in ("0", "false", "no", "off")
         unblock_raw = (os.getenv("TURNSTILE_UNBLOCK_RENDERING", "0") or "0").strip().lower()
         self.unblock_rendering = unblock_raw in ("1", "true", "yes", "on")
@@ -285,6 +285,7 @@ class TurnstileAPIServer:
                     f"(concurrency_slots={self.thread_count}, "
                     f"browser_instances={self.browser_instance_count}, "
                     f"keep_alive={self.keep_browser_alive}, "
+                    f"low_resource={self.low_resource_mode}, "
                     f"idle_reclaim={self.idle_sec:.0f}s)"
                 )
                 if self.keep_browser_alive and self.idle_sec > 0:
@@ -409,6 +410,8 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser slot {i+1} config: {config['browser_name']} {config['browser_version']}")
                 logger.debug(f"Browser slot {i+1} User-Agent: {config['useragent']}")
                 logger.debug(f"Browser slot {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
+            if self.browser_type == "camoufox":
+                logger.debug(f"Camoufox launch options: {self._camoufox_launch_options()}")
 
     def _camoufox_launch_options(self) -> dict:
         options = {
@@ -417,11 +420,17 @@ class TurnstileAPIServer:
         }
         if self.low_resource_mode:
             options.update({
-                "block_images": True,
                 "block_webrtc": True,
                 "disable_coop": True,
             })
         return options
+
+    def _camoufox_launch_options_summary(self) -> dict:
+        options = self._camoufox_launch_options()
+        return {
+            key: [str(item) for item in value] if isinstance(value, list) else value
+            for key, value in options.items()
+        }
 
     async def _drain_pool_discard(self) -> None:
         """Empty the asyncio queue without closing browsers (caller closes)."""
@@ -1824,6 +1833,7 @@ class TurnstileAPIServer:
             "keep_browser_alive": bool(self.keep_browser_alive),
             "low_resource_mode": bool(self.low_resource_mode),
             "unblock_rendering": bool(self.unblock_rendering),
+            "camoufox_launch_options": self._camoufox_launch_options_summary() if self.browser_type == "camoufox" else None,
             "worker_mode": self.worker_mode,
             "worker_timeout": self.worker_timeout,
             "idle_sec": self.idle_sec,
