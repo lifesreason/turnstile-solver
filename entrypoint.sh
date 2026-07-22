@@ -8,6 +8,10 @@ THREAD="${TURNSTILE_THREAD:-1}"
 INSTANCES="${TURNSTILE_BROWSER_INSTANCES:-1}"
 BROWSER_TYPE="${TURNSTILE_BROWSER_TYPE:-camoufox}"
 KEEP_ALIVE="${TURNSTILE_KEEP_BROWSER_ALIVE:-1}"
+POOL_ACQUIRE_TIMEOUT="${TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC:-120}"
+SOLVE_TIMEOUT="${TURNSTILE_SOLVE_TIMEOUT_SEC:-60}"
+MAX_PENDING="${TURNSTILE_MAX_PENDING_TASKS:-4}"
+HEALTH_STUCK="${TURNSTILE_HEALTH_STUCK_SEC:-180}"
 DEBUG_FLAG=()
 if [[ "${TURNSTILE_DEBUG:-0}" == "1" || "${TURNSTILE_DEBUG:-false}" == "true" ]]; then
   DEBUG_FLAG=(--debug)
@@ -34,7 +38,7 @@ if [[ "${BROWSER_TYPE}" == "camoufox" ]]; then
   fi
 fi
 
-echo "[turnstile-solver] browser=${BROWSER_TYPE} profile=${TURNSTILE_CAMOUFOX_PROFILE:-compact} concurrency_slots=${THREAD} browser_instances=${INSTANCES} worker_mode=${TURNSTILE_WORKER_MODE:-inline} keep_alive=${KEEP_ALIVE} idle=${TURNSTILE_IDLE_SEC:-60}s recycle_tasks=${TURNSTILE_BROWSER_RECYCLE_TASKS:-25} recycle_rss_mb=${TURNSTILE_BROWSER_RECYCLE_RSS_MB:-800} ${HOST}:${PORT} lazy=${TURNSTILE_LAZY:-1}"
+echo "[turnstile-solver] browser=${BROWSER_TYPE} profile=${TURNSTILE_CAMOUFOX_PROFILE:-compact} concurrency_slots=${THREAD} browser_instances=${INSTANCES} worker_mode=${TURNSTILE_WORKER_MODE:-inline} keep_alive=${KEEP_ALIVE} idle=${TURNSTILE_IDLE_SEC:-60}s recycle_tasks=${TURNSTILE_BROWSER_RECYCLE_TASKS:-25} recycle_rss_mb=${TURNSTILE_BROWSER_RECYCLE_RSS_MB:-800} pool_acquire_timeout=${POOL_ACQUIRE_TIMEOUT}s solve_timeout=${SOLVE_TIMEOUT}s max_pending=${MAX_PENDING} health_stuck=${HEALTH_STUCK}s ${HOST}:${PORT} lazy=${TURNSTILE_LAZY:-1}"
 exec python api_solver.py \
   --browser_type "${BROWSER_TYPE}" \
   --thread "${THREAD}" \

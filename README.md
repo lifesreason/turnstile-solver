@@ -235,7 +235,9 @@ socks5://127.0.0.1:7890
 | `TURNSTILE_SOLVE_TIMEOUT_SEC` | `60` | 浏览器内实际等待 Turnstile token 的最长秒数，用于缩短失败任务高资源占用时间 |
 | `TURNSTILE_BROWSER_RECYCLE_TASKS` | `25` | 常驻浏览器复用多少个任务后强制回收；`0` 表示不按任务数回收 |
 | `TURNSTILE_BROWSER_RECYCLE_RSS_MB` | `800` | 浏览器/子进程 RSS 超过该阈值(MB)时任务结束后强制回收；`0` 关闭 |
-| `TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC` | `30` | 从浏览器池取槽位超时秒数；超时后任务失败并重建池 |
+| `TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC` | `120` | 从浏览器池取槽位超时秒数；其它任务正在使用浏览器时不会关闭活动浏览器 |
+| `TURNSTILE_MAX_PENDING_TASKS` | `4` | 待处理任务上限；超过后拒绝新任务，防止调用方无限堆积内存 |
+| `TURNSTILE_HEALTH_STUCK_SEC` | `180` | 最老任务超过该秒数后 `/health` 返回 503，交给 Docker 健康检查重启 |
 | `TURNSTILE_IDLE_SEC` | `60` | 保温模式下的空闲回收秒数；仅 `TURNSTILE_KEEP_BROWSER_ALIVE=1` 时有意义 |
 | `TURNSTILE_PROXY` | `0` | `1` 表示启用 `proxies.txt` 代理池 |
 | `TURNSTILE_SHM_SIZE` | `512mb` | Docker `/dev/shm` 大小；复杂页面或更高并发可设 `1gb` / `2gb` |
@@ -260,7 +262,9 @@ TURNSTILE_WORKER_TIMEOUT=120
 TURNSTILE_SOLVE_TIMEOUT_SEC=60
 TURNSTILE_BROWSER_RECYCLE_TASKS=25
 TURNSTILE_BROWSER_RECYCLE_RSS_MB=800
-TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC=30
+TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC=120
+TURNSTILE_MAX_PENDING_TASKS=4
+TURNSTILE_HEALTH_STUCK_SEC=180
 TURNSTILE_IDLE_SEC=60
 TURNSTILE_SHM_SIZE=512mb
 ```
@@ -332,6 +336,9 @@ curl -s http://127.0.0.1:5072/health
 | `worker_queued` | process worker 模式下等待执行的任务数量 |
 | `worker_running` | process worker 模式下正在执行的任务数量 |
 | `worker_completed` | process worker 模式下已完成任务数量 |
+| `pending_tasks` | 当前已接收但尚未结束的任务数量 |
+| `oldest_task_age_sec` | 当前最老任务已运行秒数 |
+| `health_degraded` | 是否检测到任务长时间没有结束；为 `true` 时 HTTP 状态为 503 |
 | `solve_timeout_sec` | 浏览器内求解阶段的超时秒数 |
 | `browser_recycle_tasks` | 常驻浏览器按任务数回收的阈值 |
 | `browser_recycle_rss_mb` | 浏览器/子进程 RSS 回收阈值(MB) |

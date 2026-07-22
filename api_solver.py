@@ -129,12 +129,12 @@ class TurnstileAPIServer:
             self.browser_recycle_rss_mb = 0.0
         try:
             self.pool_acquire_timeout_sec = float(
-                os.getenv("TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC", "30") or 30
+                os.getenv("TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC", "120") or 120
             )
         except (TypeError, ValueError):
-            self.pool_acquire_timeout_sec = 30.0
+            self.pool_acquire_timeout_sec = 120.0
         if self.pool_acquire_timeout_sec <= 0:
-            self.pool_acquire_timeout_sec = 30.0
+            self.pool_acquire_timeout_sec = 120.0
         self.worker_mode = (os.getenv("TURNSTILE_WORKER_MODE", "inline") or "inline").strip().lower()
         if self.keep_browser_alive and self.worker_mode == "process":
             logger.warning(
@@ -154,9 +154,26 @@ class TurnstileAPIServer:
             self.solve_timeout_sec = 60.0
         if self.solve_timeout_sec <= 0:
             self.solve_timeout_sec = 60.0
+        try:
+            self.max_pending_tasks = int(
+                os.getenv("TURNSTILE_MAX_PENDING_TASKS", "4") or 4
+            )
+        except (TypeError, ValueError):
+            self.max_pending_tasks = 4
+        if self.max_pending_tasks < 1:
+            self.max_pending_tasks = 4
+        try:
+            self.health_stuck_sec = float(
+                os.getenv("TURNSTILE_HEALTH_STUCK_SEC", "180") or 180
+            )
+        except (TypeError, ValueError):
+            self.health_stuck_sec = 180.0
+        if self.health_stuck_sec <= 0:
+            self.health_stuck_sec = 180.0
         self._worker_tasks_queued = 0
         self._worker_tasks_running = 0
         self._worker_tasks_completed = 0
+        self._task_started_at: dict[str, float] = {}
         self._worker_semaphore = asyncio.Semaphore(self.thread_count)
 
         # Initialize useragent and sec_ch_ua attributes
@@ -958,6 +975,7 @@ class TurnstileAPIServer:
                     )
                 await save_result(task_id, "turnstile", result)
         finally:
+            self._task_started_at.pop(task_id, None)
             if not entered_worker:
                 self._worker_tasks_queued = max(0, self._worker_tasks_queued - 1)
             else:
@@ -1575,14 +1593,24 @@ class TurnstileAPIServer:
                     "error": f"pool_acquire_timeout_{self.pool_acquire_timeout_sec:.0f}s",
                     "resource_report": self._process_memory_report(),
                 })
-                # Force rebuild so the next task is not stuck behind a dead pool.
-                try:
-                    if self._pool_lock is None:
-                        self._pool_lock = asyncio.Lock()
-                    async with self._pool_lock:
-                        await self._shutdown_browsers()
-                except Exception as reclaim_err:
-                    logger.warning(f"Pool reclaim after acquire timeout failed: {reclaim_err}")
+                # A second task can legitimately time out while the only browser
+                # is solving another task. Never close that active browser from
+                # the waiting task; doing so makes the first task fail as well.
+                active_solve_count = max(0, self._in_flight - 1)
+                if active_solve_count > 0:
+                    logger.warning(
+                        "Browser slot acquire timed out: another task is using the browser; "
+                        "skip pool shutdown"
+                    )
+                else:
+                    # No other task is active, so an empty pool is a real leak.
+                    try:
+                        if self._pool_lock is None:
+                            self._pool_lock = asyncio.Lock()
+                        async with self._pool_lock:
+                            await self._shutdown_browsers()
+                    except Exception as reclaim_err:
+                        logger.warning(f"Pool reclaim after acquire timeout failed: {reclaim_err}")
                 return
             except Exception as e:
                 logger.error(f"Failed to acquire browser from pool: {e}")
@@ -1827,6 +1855,7 @@ class TurnstileAPIServer:
                         logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
         finally:
             # Always release in-flight even on early return / unexpected exception.
+            self._task_started_at.pop(task_id, None)
             if browser is not None:
                 self._tasks_since_recycle += 1
             if self._in_flight > 0:
@@ -1868,7 +1897,17 @@ class TurnstileAPIServer:
                 "errorDescription": "Both 'url' and 'sitekey' are required"
             }
 
+        if len(self._task_started_at) >= self.max_pending_tasks:
+            return None, {
+                "errorId": 1,
+                "errorCode": "ERROR_TOO_MANY_TASKS",
+                "errorDescription": (
+                    f"Too many pending tasks; limit={self.max_pending_tasks}"
+                ),
+            }
+
         task_id = str(uuid.uuid4())
+        self._task_started_at[task_id] = time.time()
         await save_result(task_id, "turnstile", {
             "status": "CAPTCHA_NOT_READY",
             "createTime": int(time.time()),
@@ -1909,6 +1948,7 @@ class TurnstileAPIServer:
                 )
             return task_id, None
         except Exception as e:
+            self._task_started_at.pop(task_id, None)
             logger.error(f"Unexpected error processing request: {str(e)}")
             return None, {
                 "errorId": 1,
@@ -2099,8 +2139,19 @@ class TurnstileAPIServer:
         idle_for = None
         if self._last_used:
             idle_for = round(time.time() - self._last_used, 1)
-        return jsonify({
+        now = time.time()
+        task_ages = [
+            max(0.0, now - started_at)
+            for started_at in self._task_started_at.values()
+        ]
+        oldest_task_age = round(max(task_ages), 1) if task_ages else None
+        health_degraded = (
+            oldest_task_age is not None
+            and oldest_task_age > self.health_stuck_sec
+        )
+        payload = {
             "ok": True,
+            "health_degraded": health_degraded,
             "lazy": bool(self.lazy_browsers),
             "keep_browser_alive": bool(self.keep_browser_alive),
             "low_resource_mode": bool(self.low_resource_mode),
@@ -2109,6 +2160,10 @@ class TurnstileAPIServer:
             "worker_mode": self.worker_mode,
             "worker_timeout": self.worker_timeout,
             "solve_timeout_sec": self.solve_timeout_sec,
+            "max_pending_tasks": self.max_pending_tasks,
+            "pending_tasks": len(self._task_started_at),
+            "health_stuck_sec": self.health_stuck_sec,
+            "oldest_task_age_sec": oldest_task_age,
             "worker_capacity": self.thread_count,
             "worker_queued": int(self._worker_tasks_queued or 0),
             "worker_running": int(self._worker_tasks_running or 0),
@@ -2128,7 +2183,15 @@ class TurnstileAPIServer:
             "in_flight": int(self._in_flight or 0),
             "idle_for_sec": idle_for,
             **self._process_memory_report(),
-        }), 200
+        }
+        if health_degraded:
+            payload["ok"] = False
+            payload["error"] = "task_stuck_timeout"
+            logger.error(
+                f"Health degraded: oldest task age={oldest_task_age:.1f}s "
+                f"> threshold={self.health_stuck_sec:.1f}s"
+            )
+        return jsonify(payload), 503 if health_degraded else 200
 
     async def reclaim(self):
         """Force reclaim browser pool (manual memory drop)."""
