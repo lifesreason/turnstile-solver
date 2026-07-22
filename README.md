@@ -8,9 +8,10 @@
 - 服务启动后不立即启动浏览器，第一次收到解题任务时才懒加载。
 - 默认只启动 1 个真实浏览器进程。
 - 默认在主服务进程内复用 Camoufox，减少连续调用时反复冷启动造成的 CPU 峰值。
-- 默认 60 秒没有新任务后释放浏览器，并在复用 100 个任务后强制回收一次。
-- 默认使用 Camoufox `compact` 资源档位，限制 Firefox 子进程并关闭 cache/prefetch。
-- 默认持续阻断图片、字体、样式等重页面资源，减少单次解题峰值。
+- 默认 60 秒没有新任务后释放浏览器，并在复用 25 个任务后强制回收一次。
+- 浏览器子进程 RSS 超过约 800MB 时，任务结束后也会强制回收，避免长跑涨到 1GB+。
+- 默认使用 Camoufox `compact` 资源档位：单内容进程、关 cache/prefetch/WebRender、禁用图片解码。
+- 默认持续阻断图片、字体、样式、媒体等重页面资源，减少单次解题峰值。
 - `/health` 提供浏览器池、进程 RSS 和浏览器子进程诊断信息。
 
 > 请只在你有授权的业务流程中使用本服务。Turnstile token 与访问页面、站点 key、出口 IP、会话状态等因素有关，生成后也有时效限制。
@@ -231,7 +232,9 @@ socks5://127.0.0.1:7890
 | `TURNSTILE_WORKER_MODE` | `inline` | `inline` 表示在主服务内复用浏览器；`process` 表示每个任务使用独立 worker 子进程 |
 | `TURNSTILE_WORKER_TIMEOUT` | `120` | worker 单任务超时秒数，超时后主服务会终止 worker 进程树 |
 | `TURNSTILE_SOLVE_TIMEOUT_SEC` | `60` | 浏览器内实际等待 Turnstile token 的最长秒数，用于缩短失败任务高资源占用时间 |
-| `TURNSTILE_BROWSER_RECYCLE_TASKS` | `100` | 常驻浏览器复用多少个任务后强制回收；`0` 表示不按任务数回收 |
+| `TURNSTILE_BROWSER_RECYCLE_TASKS` | `25` | 常驻浏览器复用多少个任务后强制回收；`0` 表示不按任务数回收 |
+| `TURNSTILE_BROWSER_RECYCLE_RSS_MB` | `800` | 浏览器/子进程 RSS 超过该阈值(MB)时任务结束后强制回收；`0` 关闭 |
+| `TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC` | `30` | 从浏览器池取槽位超时秒数；超时后任务失败并重建池 |
 | `TURNSTILE_IDLE_SEC` | `60` | 保温模式下的空闲回收秒数；仅 `TURNSTILE_KEEP_BROWSER_ALIVE=1` 时有意义 |
 | `TURNSTILE_PROXY` | `0` | `1` 表示启用 `proxies.txt` 代理池 |
 | `TURNSTILE_SHM_SIZE` | `512mb` | Docker `/dev/shm` 大小；复杂页面或更高并发可设 `1gb` / `2gb` |
@@ -254,7 +257,9 @@ TURNSTILE_UNBLOCK_RENDERING=0
 TURNSTILE_WORKER_MODE=inline
 TURNSTILE_WORKER_TIMEOUT=120
 TURNSTILE_SOLVE_TIMEOUT_SEC=60
-TURNSTILE_BROWSER_RECYCLE_TASKS=100
+TURNSTILE_BROWSER_RECYCLE_TASKS=25
+TURNSTILE_BROWSER_RECYCLE_RSS_MB=800
+TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC=30
 TURNSTILE_IDLE_SEC=60
 TURNSTILE_SHM_SIZE=512mb
 ```
@@ -264,8 +269,8 @@ TURNSTILE_SHM_SIZE=512mb
 - 启动后仍然只跑轻量 HTTP 进程，首次任务才启动 Camoufox。
 - 连续调用时复用同一个 Camoufox，降低反复启动浏览器造成的 CPU 峰值。
 - 60 秒无新任务后自动释放浏览器。
-- 常驻浏览器每处理 100 个任务后强制回收一次，避免长期复用后内存膨胀。
-- `compact` 档会限制 Firefox 内容进程，关闭 cache/prefetch，但不会默认禁用图片加载。
+- 常驻浏览器每处理 25 个任务后强制回收一次；浏览器树 RSS 超过约 800MB 时也会回收，避免长跑涨到 1GB+。
+- `compact` 档限制 Firefox 为单内容进程，关闭 cache/prefetch/WebRender，并用 prefs + 路由双重阻断图片/字体/样式。
 - 如果 Turnstile 长时间没有返回 token，`TURNSTILE_SOLVE_TIMEOUT_SEC` 会提前结束浏览器求解，避免失败任务持续占用高 CPU / 高内存。
 - 如果 compact 档影响通过率，先改成 `TURNSTILE_CAMOUFOX_PROFILE=balanced`；仍有问题再设 `off`。
 
@@ -328,6 +333,8 @@ curl -s http://127.0.0.1:5072/health
 | `worker_completed` | process worker 模式下已完成任务数量 |
 | `solve_timeout_sec` | 浏览器内求解阶段的超时秒数 |
 | `browser_recycle_tasks` | 常驻浏览器按任务数回收的阈值 |
+| `browser_recycle_rss_mb` | 浏览器/子进程 RSS 回收阈值(MB) |
+| `pool_acquire_timeout_sec` | 取浏览器池槽位超时秒数 |
 | `tasks_since_recycle` | 当前浏览器池已复用的任务数量 |
 
 判断方式：
@@ -336,6 +343,7 @@ curl -s http://127.0.0.1:5072/health
 - `worker_mode = inline` 且 `in_flight <= 1` 但 Docker 面板仍到 1GB+：这是单个 Camoufox/Firefox 进程树的峰值，不是 process worker 叠加。
 - `worker_queued > 0`：调用方已经并行提交了多个任务；process 模式下会排队，不会同时启动多个 worker，但失败任务会拉长整体高资源窗口。
 - `tasks_since_recycle` 接近 `browser_recycle_tasks`：下一次任务结束后会回收并重建浏览器池。
+- `browser_process_rss_mb` 接近或超过 `browser_recycle_rss_mb`：下一任务结束后会按 RSS 强制回收。
 - `browser_process_rss_mb = 0` 但 Docker 面板仍显示高：更可能是容器 page cache 或面板统计口径，不是活跃浏览器进程 RSS。
 - `pool_ready = true` 且 `owned > 0`：浏览器池仍保温；确认是否设置了 `TURNSTILE_KEEP_BROWSER_ALIVE=1`。
 
@@ -388,7 +396,9 @@ TURNSTILE_CAMOUFOX_PROFILE: compact
 TURNSTILE_UNBLOCK_RENDERING: "0"
 TURNSTILE_WORKER_MODE: inline
 TURNSTILE_WORKER_TIMEOUT: "120"
-TURNSTILE_BROWSER_RECYCLE_TASKS: "100"
+TURNSTILE_BROWSER_RECYCLE_TASKS: "25"
+TURNSTILE_BROWSER_RECYCLE_RSS_MB: "800"
+TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC: "30"
 TURNSTILE_BROWSER_INSTANCES: "1"
 TURNSTILE_THREAD: "1"
 shm_size: "536870912"

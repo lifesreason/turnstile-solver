@@ -5,7 +5,7 @@ __pycache__/
 .pytest_cache/
 logs/
 keys/
-.env
+
 *.log
 *.pid
 .DS_Store

@@ -34,7 +34,7 @@ if [[ "${BROWSER_TYPE}" == "camoufox" ]]; then
   fi
 fi
 
-echo "[turnstile-solver] browser=${BROWSER_TYPE} profile=${TURNSTILE_CAMOUFOX_PROFILE:-compact} concurrency_slots=${THREAD} browser_instances=${INSTANCES} worker_mode=${TURNSTILE_WORKER_MODE:-inline} keep_alive=${KEEP_ALIVE} idle=${TURNSTILE_IDLE_SEC:-60}s recycle_tasks=${TURNSTILE_BROWSER_RECYCLE_TASKS:-100} ${HOST}:${PORT} lazy=${TURNSTILE_LAZY:-1}"
+echo "[turnstile-solver] browser=${BROWSER_TYPE} profile=${TURNSTILE_CAMOUFOX_PROFILE:-compact} concurrency_slots=${THREAD} browser_instances=${INSTANCES} worker_mode=${TURNSTILE_WORKER_MODE:-inline} keep_alive=${KEEP_ALIVE} idle=${TURNSTILE_IDLE_SEC:-60}s recycle_tasks=${TURNSTILE_BROWSER_RECYCLE_TASKS:-25} recycle_rss_mb=${TURNSTILE_BROWSER_RECYCLE_RSS_MB:-800} ${HOST}:${PORT} lazy=${TURNSTILE_LAZY:-1}"
 exec python api_solver.py \
   --browser_type "${BROWSER_TYPE}" \
   --thread "${THREAD}" \

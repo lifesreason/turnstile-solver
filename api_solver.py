@@ -110,11 +110,31 @@ class TurnstileAPIServer:
         self._tasks_since_recycle = 0
         self._browser_pid_map: dict[int, set[int]] = {}
         try:
-            self.browser_recycle_tasks = int(os.getenv("TURNSTILE_BROWSER_RECYCLE_TASKS", "100") or 100)
+            # Recycle more often than the old 100-task default so long-running
+            # keep-alive pools cannot drift toward multi-GB Firefox trees.
+            self.browser_recycle_tasks = int(os.getenv("TURNSTILE_BROWSER_RECYCLE_TASKS", "25") or 25)
         except (TypeError, ValueError):
-            self.browser_recycle_tasks = 100
+            self.browser_recycle_tasks = 25
         if self.browser_recycle_tasks < 0:
             self.browser_recycle_tasks = 0
+        try:
+            # Soft RSS guard: after a task, if browser tree exceeds this, rebuild.
+            # 0 disables. Default 800MB catches the 1GB+ climb before 1.5GB panels.
+            self.browser_recycle_rss_mb = float(
+                os.getenv("TURNSTILE_BROWSER_RECYCLE_RSS_MB", "800") or 800
+            )
+        except (TypeError, ValueError):
+            self.browser_recycle_rss_mb = 800.0
+        if self.browser_recycle_rss_mb < 0:
+            self.browser_recycle_rss_mb = 0.0
+        try:
+            self.pool_acquire_timeout_sec = float(
+                os.getenv("TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC", "30") or 30
+            )
+        except (TypeError, ValueError):
+            self.pool_acquire_timeout_sec = 30.0
+        if self.pool_acquire_timeout_sec <= 0:
+            self.pool_acquire_timeout_sec = 30.0
         self.worker_mode = (os.getenv("TURNSTILE_WORKER_MODE", "inline") or "inline").strip().lower()
         if self.keep_browser_alive and self.worker_mode == "process":
             logger.warning(
@@ -323,6 +343,7 @@ class TurnstileAPIServer:
                     f"camoufox_profile={self.camoufox_profile}, "
                     f"worker_mode={self.worker_mode}, "
                     f"recycle_tasks={self.browser_recycle_tasks}, "
+                    f"recycle_rss_mb={self.browser_recycle_rss_mb:.0f}, "
                     f"solve_timeout={self.solve_timeout_sec:.0f}s, "
                     f"idle_reclaim={self.idle_sec:.0f}s)"
                 )
@@ -467,27 +488,57 @@ class TurnstileAPIServer:
         if profile in ("0", "off", "none", "false", "no"):
             return {}
 
+        # Shared baseline: kill caches/prefetch so each solve does not leave
+        # multi-hundred-MB of retained page state in the Firefox tree.
         prefs = {
             "browser.cache.disk.enable": False,
             "browser.cache.memory.enable": False,
+            "browser.cache.memory.capacity": 0,
             "browser.cache.offline.enable": False,
             "browser.sessionhistory.max_total_viewers": 0,
             "browser.sessionstore.max_tabs_undo": 0,
             "browser.sessionstore.max_windows_undo": 0,
+            "browser.sessionstore.resume_from_crash": False,
+            "browser.sessionstore.interval": 600000,
             "media.peerconnection.enabled": False,
+            "media.autoplay.default": 5,
+            "media.autoplay.enabled": False,
+            "media.navigator.enabled": False,
             "network.dns.disablePrefetch": True,
             "network.predictor.enabled": False,
             "network.prefetch-next": False,
+            "network.http.speculative-parallel-limit": 0,
+            "toolkit.telemetry.enabled": False,
+            "memory.free_dirty_pages": True,
         }
 
-        if profile == "compact":
+        if profile == "compact" or self.low_resource_mode:
+            # Single content process, no warm keep-alive, no fission — the
+            # dominant lever against 1GB+ Camoufox trees under keep-alive.
             prefs.update({
-                "dom.ipc.keepProcessesAlive.web": 1,
+                "dom.ipc.keepProcessesAlive.web": 0,
                 "dom.ipc.keepProcessesAlive.webIsolated.perOrigin": 0,
                 "dom.ipc.processCount": 1,
                 "dom.ipc.processCount.webIsolated": 1,
+                "dom.ipc.processPrelaunch.enabled": False,
                 "fission.autostart": False,
-                "toolkit.telemetry.enabled": False,
+                # Software compositing is cheaper and more predictable in Docker
+                # than WebRender/GPU paths for a 500x100 captcha viewport.
+                "layers.acceleration.disabled": True,
+                "gfx.webrender.force-disabled": True,
+                # Route handler already aborts images; this is a second belt so
+                # any missed request cannot decode large bitmaps into RSS.
+                "permissions.default.image": 2,
+                "image.animation_mode": "none",
+            })
+        elif profile == "balanced":
+            prefs.update({
+                "dom.ipc.keepProcessesAlive.web": 0,
+                "dom.ipc.keepProcessesAlive.webIsolated.perOrigin": 0,
+                "dom.ipc.processCount": 2,
+                "dom.ipc.processCount.webIsolated": 1,
+                "dom.ipc.processPrelaunch.enabled": False,
+                "fission.autostart": False,
             })
 
         return prefs
@@ -501,6 +552,8 @@ class TurnstileAPIServer:
             "enable_cache": False,
             "exclude_addons": [DefaultAddons.UBO],
         }
+        # Compact/low-resource always cut WebRTC and COOP cost. block_images is
+        # intentionally NOT set here (compatibility); route + prefs handle assets.
         if self.low_resource_mode or profile_enabled:
             options.update({
                 "block_webrtc": True,
@@ -743,30 +796,52 @@ class TurnstileAPIServer:
         # Keep last_used as historical activity; do not bump it here or reclaim loops thrash.
         logger.info("Browser pool reclaimed (idle / rebuild)")
 
+    def _should_recycle_browser_pool(self) -> tuple[bool, str]:
+        """Decide whether the keep-alive pool should be torn down after a task."""
+        if not self.keep_browser_alive or not self._pool_ready:
+            # keep_browser_alive=0 always drops the pool after the task.
+            if not self.keep_browser_alive and self._pool_ready:
+                return True, "keep_browser_alive=0"
+            return False, ""
+        if self.browser_recycle_tasks > 0 and self._tasks_since_recycle >= self.browser_recycle_tasks:
+            return True, (
+                f"task_limit tasks={self._tasks_since_recycle} "
+                f"limit={self.browser_recycle_tasks}"
+            )
+        if self.browser_recycle_rss_mb > 0:
+            try:
+                report = self._process_memory_report()
+                browser_rss = float(report.get("browser_process_rss_mb") or 0)
+                children_rss = float(report.get("children_rss_mb") or 0)
+                rss = max(browser_rss, children_rss)
+                if rss >= self.browser_recycle_rss_mb:
+                    return True, (
+                        f"rss_limit browser_rss={browser_rss:.0f}MB "
+                        f"children_rss={children_rss:.0f}MB "
+                        f"limit={self.browser_recycle_rss_mb:.0f}MB"
+                    )
+            except Exception as e:
+                if self.debug:
+                    logger.debug(f"RSS recycle check failed: {e}")
+        return False, ""
+
     async def _reclaim_after_task_if_needed(self) -> None:
-        """Drop browser processes immediately in low-memory mode."""
-        should_recycle = (
-            self.keep_browser_alive
-            and self.browser_recycle_tasks > 0
-            and self._tasks_since_recycle >= self.browser_recycle_tasks
-        )
-        if (self.keep_browser_alive and not should_recycle) or self._in_flight > 0 or not self._pool_ready:
+        """Drop browser processes when keep-alive is off, task/RSS limits hit."""
+        should_recycle, reason = self._should_recycle_browser_pool()
+        if self.keep_browser_alive and not should_recycle:
+            return
+        if self._in_flight > 0 or not self._pool_ready:
             return
         if self._pool_lock is None:
             self._pool_lock = asyncio.Lock()
         async with self._pool_lock:
-            should_recycle = (
-                self.keep_browser_alive
-                and self.browser_recycle_tasks > 0
-                and self._tasks_since_recycle >= self.browser_recycle_tasks
-            )
-            if (self.keep_browser_alive and not should_recycle) or self._in_flight > 0 or not self._pool_ready:
+            should_recycle, reason = self._should_recycle_browser_pool()
+            if self.keep_browser_alive and not should_recycle:
+                return
+            if self._in_flight > 0 or not self._pool_ready:
                 return
             if should_recycle:
-                logger.info(
-                    f"Recycling browser pool after {self._tasks_since_recycle} tasks "
-                    f"(limit={self.browser_recycle_tasks})"
-                )
+                logger.info(f"Recycling browser pool ({reason})")
             else:
                 logger.info("Low-memory mode: reclaiming browser pool after task")
             await self._shutdown_browsers()
@@ -1008,22 +1083,39 @@ class TurnstileAPIServer:
 
 
     async def _optimized_route_handler(self, route):
-        """Оптимизированный обработчик маршрутов для экономии ресурсов."""
+        """Abort heavy assets; only document/script/XHR (and CF origins) load."""
         url = route.request.url
         resource_type = route.request.resource_type
 
-        allowed_types = {'document', 'script', 'xhr', 'fetch'}
+        # Never load media/images/fonts/styles — they dominate decode CPU + RSS.
+        blocked_types = {
+            "image",
+            "media",
+            "font",
+            "stylesheet",
+            "texttrack",
+            "eventsource",
+            "websocket",
+            "manifest",
+            "other",
+        }
+        if resource_type in blocked_types:
+            await route.abort()
+            return
+
+        allowed_types = {"document", "script", "xhr", "fetch"}
 
         allowed_domains = [
-            'challenges.cloudflare.com',
-            'static.cloudflareinsights.com',
-            'cloudflare.com'
+            "challenges.cloudflare.com",
+            "static.cloudflareinsights.com",
+            "cloudflare.com",
         ]
-        
+
         if resource_type in allowed_types:
             await route.continue_()
         elif any(domain in url for domain in allowed_domains):
-            await route.continue_() 
+            # CF challenge scripts/XHR only — heavy types already aborted above.
+            await route.continue_()
         else:
             await route.abort()
 
@@ -1484,9 +1576,34 @@ class TurnstileAPIServer:
             try:
                 await self._ensure_pool()
                 self._last_used = time.time()
-                index, browser, browser_config = await self.browser_pool.get()
+                # Never block forever on a leaked slot — that freezes the solver
+                # while /health still returns ok and memory stays elevated.
+                index, browser, browser_config = await asyncio.wait_for(
+                    self.browser_pool.get(),
+                    timeout=self.pool_acquire_timeout_sec,
+                )
                 acquired = True
                 self._last_used = time.time()
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Timed out acquiring browser after "
+                    f"{self.pool_acquire_timeout_sec:.0f}s (queue empty / slot leaked)"
+                )
+                await save_result(task_id, "turnstile", {
+                    "value": "CAPTCHA_FAIL",
+                    "elapsed_time": 0,
+                    "error": f"pool_acquire_timeout_{self.pool_acquire_timeout_sec:.0f}s",
+                    "resource_report": self._process_memory_report(),
+                })
+                # Force rebuild so the next task is not stuck behind a dead pool.
+                try:
+                    if self._pool_lock is None:
+                        self._pool_lock = asyncio.Lock()
+                    async with self._pool_lock:
+                        await self._shutdown_browsers()
+                except Exception as reclaim_err:
+                    logger.warning(f"Pool reclaim after acquire timeout failed: {reclaim_err}")
+                return
             except Exception as e:
                 logger.error(f"Failed to acquire browser from pool: {e}")
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": str(e)})
@@ -1572,12 +1689,14 @@ class TurnstileAPIServer:
                     cdata = detected_params.get("cdata") or cdata
 
                 await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
-                await asyncio.sleep(3)
+                # Short settle; longer sleeps just keep Firefox CPU-hot while idle.
+                await asyncio.sleep(1.0)
 
                 locator = page.locator('input[name="cf-turnstile-response"]')
-                max_attempts = 30
+                # Bound by solve_timeout_sec; attempt count is a secondary ceiling.
+                max_attempts = max(12, int(self.solve_timeout_sec * 2))
                 click_count = 0
-                max_clicks = 10
+                max_clicks = 6
                 solve_wait_started = time.time()
                 deadline = solve_wait_started + self.solve_timeout_sec
 
@@ -1643,8 +1762,9 @@ class TurnstileAPIServer:
                             elif not click_success and self.debug:
                                 logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1} (click #{click_count}/{max_clicks})")
 
-                        wait_time = min(0.5 + (attempt * 0.05), 2.0)
-                        await asyncio.sleep(wait_time)
+                        # Flat 0.5s poll — previous ramp to 2s stretched failed
+                        # solves and kept CPU elevated longer than necessary.
+                        await asyncio.sleep(0.5)
 
                         if self.debug and attempt % 5 == 0:
                             logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - Waiting for token (clicks: {click_count}/{max_clicks})")
@@ -1692,12 +1812,21 @@ class TurnstileAPIServer:
 
                 if context is not None:
                     try:
-                        await context.close()
+                        await asyncio.wait_for(context.close(), timeout=5.0)
                         if self.debug:
                             logger.debug(f"Browser {index}: Context closed successfully")
                     except Exception as e:
-                        if self.debug:
-                            logger.warning(f"Browser {index}: Error closing context: {str(e)}")
+                        # Stuck close() can pin a content process forever — drop
+                        # the browser from the pool so the next task rebuilds.
+                        acquired = False
+                        logger.warning(
+                            f"Browser {index}: Error closing context (discarding browser): {str(e)}"
+                        )
+                        try:
+                            await self._discard_browser_slots(browser)
+                            await self._force_kill_browser(browser, index=index)
+                        except Exception:
+                            pass
 
                 try:
                     if acquired and browser is not None and index is not None:
@@ -2007,6 +2136,8 @@ class TurnstileAPIServer:
             "worker_running": int(self._worker_tasks_running or 0),
             "worker_completed": int(self._worker_tasks_completed or 0),
             "browser_recycle_tasks": self.browser_recycle_tasks,
+            "browser_recycle_rss_mb": self.browser_recycle_rss_mb,
+            "pool_acquire_timeout_sec": self.pool_acquire_timeout_sec,
             "tasks_since_recycle": self._tasks_since_recycle,
             "idle_sec": self.idle_sec,
             "pool_ready": bool(self._pool_ready),
