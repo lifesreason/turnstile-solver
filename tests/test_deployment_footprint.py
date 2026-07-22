@@ -10,9 +10,14 @@ class DeploymentFootprintTest(unittest.TestCase):
     def test_compose_defaults_are_low_memory(self):
         compose = (ROOT / "docker-compose.yml").read_text()
 
+        # All runtime knobs are env-overridable via ${VAR:-default}
         self.assertIn('TURNSTILE_THREAD: "${TURNSTILE_THREAD:-1}"', compose)
         self.assertIn('TURNSTILE_DEBUG: "${TURNSTILE_DEBUG:-0}"', compose)
         self.assertIn('TURNSTILE_IDLE_SEC: "${TURNSTILE_IDLE_SEC:-60}"', compose)
+        self.assertIn('TURNSTILE_KEEP_BROWSER_ALIVE: "${TURNSTILE_KEEP_BROWSER_ALIVE:-1}"', compose)
+        self.assertIn('TURNSTILE_BROWSER_RECYCLE_TASKS: "${TURNSTILE_BROWSER_RECYCLE_TASKS:-25}"', compose)
+        self.assertIn('TURNSTILE_BROWSER_RECYCLE_RSS_MB: "${TURNSTILE_BROWSER_RECYCLE_RSS_MB:-800}"', compose)
+        self.assertIn('image: ${TURNSTILE_IMAGE:-', compose)
 
         match = re.search(r'shm_size:\s*"\$\{TURNSTILE_SHM_SIZE:-(?P<size>\d+)(?P<unit>[mMgG])b\}"', compose)
         self.assertIsNotNone(match, "docker-compose.yml must set shm_size")
@@ -147,11 +152,9 @@ class DeploymentFootprintTest(unittest.TestCase):
         self.assertIn('"dom.ipc.processCount.webIsolated"', solver)
         self.assertIn('"fission.autostart"', solver)
         self.assertIn('"network.prefetch-next"', solver)
-        self.assertIn('"dom.ipc.processPrelaunch.enabled"', solver)
-        self.assertIn('"permissions.default.image"', solver)
-        self.assertIn('"layers.acceleration.disabled"', solver)
-        self.assertIn('"gfx.webrender.force-disabled"', solver)
-        self.assertIn('"memory.free_dirty_pages"', solver)
+        # Do NOT assert image/WebRender kill-switches — they break Turnstile.
+        self.assertNotIn('"permissions.default.image"', solver)
+        self.assertNotIn('"gfx.webrender.force-disabled"', solver)
         self.assertIn("Camoufox rejected firefox_user_prefs", solver)
         self.assertIn('camoufox_options.pop("firefox_user_prefs", None)', solver)
         self.assertIn("TURNSTILE_CAMOUFOX_PROFILE=compact", dockerfile)
@@ -200,9 +203,7 @@ class DeploymentFootprintTest(unittest.TestCase):
         self.assertIn("unblock_rendering", solver)
         self.assertIn('TURNSTILE_UNBLOCK_RENDERING: "${TURNSTILE_UNBLOCK_RENDERING:-0}"', compose)
         self.assertIn("`TURNSTILE_UNBLOCK_RENDERING` | `0`", readme)
-        self.assertIn('"image"', solver)
-        self.assertIn('"stylesheet"', solver)
-        self.assertIn('"media"', solver)
+        self.assertIn("challenges.cloudflare.com", solver)
         self.assertIn("pool_acquire_timeout", solver)
         self.assertIn("context.close()", solver)
 

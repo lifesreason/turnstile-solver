@@ -10,9 +10,10 @@
 - 默认在主服务进程内复用 Camoufox，减少连续调用时反复冷启动造成的 CPU 峰值。
 - 默认 60 秒没有新任务后释放浏览器，并在复用 25 个任务后强制回收一次。
 - 浏览器子进程 RSS 超过约 800MB 时，任务结束后也会强制回收，避免长跑涨到 1GB+。
-- 默认使用 Camoufox `compact` 资源档位：单内容进程、关 cache/prefetch/WebRender、禁用图片解码。
-- 默认持续阻断图片、字体、样式、媒体等重页面资源，减少单次解题峰值。
+- 默认使用 Camoufox `compact` 资源档位：限制 Firefox 内容进程、关闭 cache/prefetch（不禁用 Turnstile 所需渲染能力）。
+- 默认阻断非 Cloudflare 的重页面资源；Cloudflare challenge 资源始终放行。
 - `/health` 提供浏览器池、进程 RSS 和浏览器子进程诊断信息。
+- 所有运行参数都可通过同目录 `.env` + `docker-compose.yml` 的 `${VAR:-默认}` 赋值。
 
 > 请只在你有授权的业务流程中使用本服务。Turnstile token 与访问页面、站点 key、出口 IP、会话状态等因素有关，生成后也有时效限制。
 
@@ -270,7 +271,7 @@ TURNSTILE_SHM_SIZE=512mb
 - 连续调用时复用同一个 Camoufox，降低反复启动浏览器造成的 CPU 峰值。
 - 60 秒无新任务后自动释放浏览器。
 - 常驻浏览器每处理 25 个任务后强制回收一次；浏览器树 RSS 超过约 800MB 时也会回收，避免长跑涨到 1GB+。
-- `compact` 档限制 Firefox 为单内容进程，关闭 cache/prefetch/WebRender，并用 prefs + 路由双重阻断图片/字体/样式。
+- `compact` 档限制 Firefox 内容进程并关闭 cache/prefetch；**不要**默认开启 `TURNSTILE_LOW_RESOURCE_MODE=1`（容易导致 Turnstile 失败）。
 - 如果 Turnstile 长时间没有返回 token，`TURNSTILE_SOLVE_TIMEOUT_SEC` 会提前结束浏览器求解，避免失败任务持续占用高 CPU / 高内存。
 - 如果 compact 档影响通过率，先改成 `TURNSTILE_CAMOUFOX_PROFILE=balanced`；仍有问题再设 `off`。
 

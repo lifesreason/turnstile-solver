@@ -484,61 +484,55 @@ class TurnstileAPIServer:
                 logger.debug(f"Camoufox launch options: {self._camoufox_launch_options()}")
 
     def _camoufox_user_prefs(self) -> dict:
+        """Firefox prefs for resource control.
+
+        Keep these conservative: aggressive image/WebRender prefs break Turnstile.
+        Memory is controlled mainly by recycle/idle reclaim, not by disabling
+        rendering features required by Cloudflare challenges.
+        """
         profile = (self.camoufox_profile or "compact").strip().lower()
         if profile in ("0", "off", "none", "false", "no"):
             return {}
 
-        # Shared baseline: kill caches/prefetch so each solve does not leave
-        # multi-hundred-MB of retained page state in the Firefox tree.
         prefs = {
             "browser.cache.disk.enable": False,
             "browser.cache.memory.enable": False,
-            "browser.cache.memory.capacity": 0,
             "browser.cache.offline.enable": False,
             "browser.sessionhistory.max_total_viewers": 0,
             "browser.sessionstore.max_tabs_undo": 0,
             "browser.sessionstore.max_windows_undo": 0,
-            "browser.sessionstore.resume_from_crash": False,
-            "browser.sessionstore.interval": 600000,
             "media.peerconnection.enabled": False,
-            "media.autoplay.default": 5,
-            "media.autoplay.enabled": False,
-            "media.navigator.enabled": False,
             "network.dns.disablePrefetch": True,
             "network.predictor.enabled": False,
             "network.prefetch-next": False,
-            "network.http.speculative-parallel-limit": 0,
-            "toolkit.telemetry.enabled": False,
-            "memory.free_dirty_pages": True,
         }
 
-        if profile == "compact" or self.low_resource_mode:
-            # Single content process, no warm keep-alive, no fission — the
-            # dominant lever against 1GB+ Camoufox trees under keep-alive.
+        if profile == "compact":
             prefs.update({
-                "dom.ipc.keepProcessesAlive.web": 0,
+                "dom.ipc.keepProcessesAlive.web": 1,
                 "dom.ipc.keepProcessesAlive.webIsolated.perOrigin": 0,
                 "dom.ipc.processCount": 1,
                 "dom.ipc.processCount.webIsolated": 1,
-                "dom.ipc.processPrelaunch.enabled": False,
                 "fission.autostart": False,
-                # Software compositing is cheaper and more predictable in Docker
-                # than WebRender/GPU paths for a 500x100 captcha viewport.
-                "layers.acceleration.disabled": True,
-                "gfx.webrender.force-disabled": True,
-                # Route handler already aborts images; this is a second belt so
-                # any missed request cannot decode large bitmaps into RSS.
-                "permissions.default.image": 2,
-                "image.animation_mode": "none",
+                "toolkit.telemetry.enabled": False,
             })
         elif profile == "balanced":
             prefs.update({
-                "dom.ipc.keepProcessesAlive.web": 0,
+                "dom.ipc.keepProcessesAlive.web": 1,
                 "dom.ipc.keepProcessesAlive.webIsolated.perOrigin": 0,
                 "dom.ipc.processCount": 2,
                 "dom.ipc.processCount.webIsolated": 1,
-                "dom.ipc.processPrelaunch.enabled": False,
                 "fission.autostart": False,
+                "toolkit.telemetry.enabled": False,
+            })
+
+        # low_resource_mode only adds mild extras that do not block challenge
+        # images/canvas. Do NOT set permissions.default.image or disable WebRender.
+        if self.low_resource_mode:
+            prefs.update({
+                "browser.cache.memory.capacity": 0,
+                "network.http.speculative-parallel-limit": 0,
+                "toolkit.telemetry.enabled": False,
             })
 
         return prefs
@@ -552,8 +546,7 @@ class TurnstileAPIServer:
             "enable_cache": False,
             "exclude_addons": [DefaultAddons.UBO],
         }
-        # Compact/low-resource always cut WebRTC and COOP cost. block_images is
-        # intentionally NOT set here (compatibility); route + prefs handle assets.
+        # Never pass block_images=True — Turnstile widgets need challenge assets.
         if self.low_resource_mode or profile_enabled:
             options.update({
                 "block_webrtc": True,
@@ -1083,28 +1076,16 @@ class TurnstileAPIServer:
 
 
     async def _optimized_route_handler(self, route):
-        """Abort heavy assets; only document/script/XHR (and CF origins) load."""
+        """Allow document/script/XHR/fetch and all Cloudflare origins.
+
+        Do not blanket-abort image/other types for CF domains: Turnstile
+        challenge assets often load from challenges.cloudflare.com as image/other.
+        Non-CF heavy assets are still aborted to limit page weight.
+        """
         url = route.request.url
         resource_type = route.request.resource_type
 
-        # Never load media/images/fonts/styles — they dominate decode CPU + RSS.
-        blocked_types = {
-            "image",
-            "media",
-            "font",
-            "stylesheet",
-            "texttrack",
-            "eventsource",
-            "websocket",
-            "manifest",
-            "other",
-        }
-        if resource_type in blocked_types:
-            await route.abort()
-            return
-
         allowed_types = {"document", "script", "xhr", "fetch"}
-
         allowed_domains = [
             "challenges.cloudflare.com",
             "static.cloudflareinsights.com",
@@ -1114,7 +1095,6 @@ class TurnstileAPIServer:
         if resource_type in allowed_types:
             await route.continue_()
         elif any(domain in url for domain in allowed_domains):
-            # CF challenge scripts/XHR only — heavy types already aborted above.
             await route.continue_()
         else:
             await route.abort()
@@ -1689,14 +1669,13 @@ class TurnstileAPIServer:
                     cdata = detected_params.get("cdata") or cdata
 
                 await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
-                # Short settle; longer sleeps just keep Firefox CPU-hot while idle.
-                await asyncio.sleep(1.0)
+                # Give Turnstile widget time to boot before polling for token.
+                await asyncio.sleep(3)
 
                 locator = page.locator('input[name="cf-turnstile-response"]')
-                # Bound by solve_timeout_sec; attempt count is a secondary ceiling.
-                max_attempts = max(12, int(self.solve_timeout_sec * 2))
+                max_attempts = 30
                 click_count = 0
-                max_clicks = 6
+                max_clicks = 10
                 solve_wait_started = time.time()
                 deadline = solve_wait_started + self.solve_timeout_sec
 
@@ -1762,9 +1741,8 @@ class TurnstileAPIServer:
                             elif not click_success and self.debug:
                                 logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1} (click #{click_count}/{max_clicks})")
 
-                        # Flat 0.5s poll — previous ramp to 2s stretched failed
-                        # solves and kept CPU elevated longer than necessary.
-                        await asyncio.sleep(0.5)
+                        wait_time = min(0.5 + (attempt * 0.05), 2.0)
+                        await asyncio.sleep(wait_time)
 
                         if self.debug and attempt % 5 == 0:
                             logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - Waiting for token (clicks: {click_count}/{max_clicks})")

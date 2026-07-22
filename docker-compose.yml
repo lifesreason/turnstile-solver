@@ -3,17 +3,25 @@
 #
 # 使用前把 image 换成你的仓库路径，例如：
 #   ghcr.io/jeck5001/turnstile-solver:latest
+#   ghcr.nju.edu.cn/lifesreason/turnstile-solver:latest
+#
+# 所有 TURNSTILE_* 变量都可通过同目录 .env 赋值，例如：
+#   TURNSTILE_THREAD=2
+#   TURNSTILE_IDLE_SEC=180
+#   TURNSTILE_SHM_SIZE=2gb
+#   TURNSTILE_DEBUG=1
+# compose 会读取 .env 并替换 ${VAR:-默认值}
 
 services:
   turnstile-solver:
-    image: ghcr.io/jeck5001/turnstile-solver:latest
+    image: ${TURNSTILE_IMAGE:-ghcr.io/jeck5001/turnstile-solver:latest}
     container_name: turnstile-solver
     restart: unless-stopped
     ports:
-      - "5072:5072"
+      - "${TURNSTILE_PUBLISH_PORT:-5072}:5072"
     environment:
-      TURNSTILE_HOST: "0.0.0.0"
-      TURNSTILE_PORT: "5072"
+      TURNSTILE_HOST: "${TURNSTILE_HOST:-0.0.0.0}"
+      TURNSTILE_PORT: "${TURNSTILE_PORT:-5072}"
       TURNSTILE_THREAD: "${TURNSTILE_THREAD:-1}"
       TURNSTILE_BROWSER_INSTANCES: "${TURNSTILE_BROWSER_INSTANCES:-1}"
       TURNSTILE_BROWSER_TYPE: "${TURNSTILE_BROWSER_TYPE:-camoufox}"
@@ -31,10 +39,11 @@ services:
       TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC: "${TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC:-30}"
       TURNSTILE_IDLE_SEC: "${TURNSTILE_IDLE_SEC:-60}"
       # 生产建议设置鉴权：业务 createTask 时 clientKey 填同一值
-      # API_KEY: "change-me"
-    # 单浏览器默认 512MB 共享内存即可；高并发或浏览器崩溃时再按需调大
+      # API_KEY: "${API_KEY:-}"
+    # 浏览器需要足够共享内存；可在 .env 设 TURNSTILE_SHM_SIZE=1gb / 2gb
     shm_size: "${TURNSTILE_SHM_SIZE:-512mb}"
     healthcheck:
+      # 镜像未必带 curl，用 Python 访问 /health 更稳
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:5072/health', timeout=5).read()\""]
       interval: 20s
       timeout: 5s
