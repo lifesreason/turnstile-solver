@@ -8,8 +8,8 @@
 - 服务启动后不立即启动浏览器，第一次收到解题任务时才懒加载。
 - 默认只启动 1 个真实浏览器进程。
 - 默认在主服务进程内复用 Camoufox，减少连续调用时反复冷启动造成的 CPU 峰值。
-- 默认 60 秒没有新任务后释放浏览器，并在复用 25 个任务后强制回收一次。
-- 浏览器子进程 RSS 超过约 800MB 时，任务结束后也会强制回收，避免长跑涨到 1GB+。
+- 默认 300 秒没有新任务后释放浏览器，并在复用 8 个任务后强制回收一次。
+- 浏览器子进程 RSS 超过约 700MB 时，任务结束后也会强制回收，避免长跑涨到 1GB+。
 - 默认使用 Camoufox `compact` 资源档位：限制 Firefox 内容进程、关闭 cache/prefetch（不禁用 Turnstile 所需渲染能力）。
 - 默认阻断非 Cloudflare 的重页面资源；Cloudflare challenge 资源始终放行。
 - `/health` 提供浏览器池、进程 RSS 和浏览器子进程诊断信息。
@@ -89,7 +89,7 @@ curl -s http://127.0.0.1:5072/health
   "browser_type": "camoufox",
   "concurrency_slots": 1,
   "browser_instances": 1,
-  "keep_browser_alive": false,
+  "keep_browser_alive": true,
   "pool_ready": false,
   "process_rss_mb": 100.0,
   "children_rss_mb": 0.0,
@@ -233,12 +233,12 @@ socks5://127.0.0.1:7890
 | `TURNSTILE_WORKER_MODE` | `inline` | `inline` 表示在主服务内复用浏览器；`process` 表示每个任务使用独立 worker 子进程 |
 | `TURNSTILE_WORKER_TIMEOUT` | `120` | worker 单任务超时秒数，超时后主服务会终止 worker 进程树 |
 | `TURNSTILE_SOLVE_TIMEOUT_SEC` | `60` | 浏览器内实际等待 Turnstile token 的最长秒数，用于缩短失败任务高资源占用时间 |
-| `TURNSTILE_BROWSER_RECYCLE_TASKS` | `25` | 常驻浏览器复用多少个任务后强制回收；`0` 表示不按任务数回收 |
-| `TURNSTILE_BROWSER_RECYCLE_RSS_MB` | `800` | 浏览器/子进程 RSS 超过该阈值(MB)时任务结束后强制回收；`0` 关闭 |
+| `TURNSTILE_BROWSER_RECYCLE_TASKS` | `8` | 常驻浏览器复用多少个任务后强制回收；`0` 表示不按任务数回收 |
+| `TURNSTILE_BROWSER_RECYCLE_RSS_MB` | `700` | 浏览器/子进程 RSS 超过该阈值(MB)时任务结束后强制回收；`0` 关闭 |
 | `TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC` | `120` | 从浏览器池取槽位超时秒数；其它任务正在使用浏览器时不会关闭活动浏览器 |
-| `TURNSTILE_MAX_PENDING_TASKS` | `4` | 待处理任务上限；超过后拒绝新任务，防止调用方无限堆积内存 |
+| `TURNSTILE_MAX_PENDING_TASKS` | `2` | 待处理任务上限；超过后拒绝新任务，防止调用方无限堆积内存 |
 | `TURNSTILE_HEALTH_STUCK_SEC` | `180` | 最老任务超过该秒数后 `/health` 返回 503，交给 Docker 健康检查重启 |
-| `TURNSTILE_IDLE_SEC` | `60` | 保温模式下的空闲回收秒数；仅 `TURNSTILE_KEEP_BROWSER_ALIVE=1` 时有意义 |
+| `TURNSTILE_IDLE_SEC` | `300` | 保温模式下的空闲回收秒数；仅 `TURNSTILE_KEEP_BROWSER_ALIVE=1` 时有意义 |
 | `TURNSTILE_PROXY` | `0` | `1` 表示启用 `proxies.txt` 代理池 |
 | `TURNSTILE_SHM_SIZE` | `512mb` | Docker `/dev/shm` 大小；复杂页面或更高并发可设 `1gb` / `2gb` |
 | `CAMOUFOX_MIN_CACHE_MB` | `500` | 容器启动时校验内置 Camoufox 资产的最小体积 |
@@ -260,12 +260,12 @@ TURNSTILE_UNBLOCK_RENDERING=0
 TURNSTILE_WORKER_MODE=inline
 TURNSTILE_WORKER_TIMEOUT=120
 TURNSTILE_SOLVE_TIMEOUT_SEC=60
-TURNSTILE_BROWSER_RECYCLE_TASKS=25
-TURNSTILE_BROWSER_RECYCLE_RSS_MB=800
+TURNSTILE_BROWSER_RECYCLE_TASKS=8
+TURNSTILE_BROWSER_RECYCLE_RSS_MB=700
 TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC=120
-TURNSTILE_MAX_PENDING_TASKS=4
+TURNSTILE_MAX_PENDING_TASKS=2
 TURNSTILE_HEALTH_STUCK_SEC=180
-TURNSTILE_IDLE_SEC=60
+TURNSTILE_IDLE_SEC=300
 TURNSTILE_SHM_SIZE=512mb
 ```
 
@@ -273,8 +273,8 @@ TURNSTILE_SHM_SIZE=512mb
 
 - 启动后仍然只跑轻量 HTTP 进程，首次任务才启动 Camoufox。
 - 连续调用时复用同一个 Camoufox，降低反复启动浏览器造成的 CPU 峰值。
-- 60 秒无新任务后自动释放浏览器。
-- 常驻浏览器每处理 25 个任务后强制回收一次；浏览器树 RSS 超过约 800MB 时也会回收，避免长跑涨到 1GB+。
+- 300 秒无新任务后自动释放浏览器。
+- 常驻浏览器每处理 8 个任务后强制回收一次；浏览器树 RSS 超过约 700MB 时也会回收，避免长跑涨到 1GB+。
 - `compact` 档限制 Firefox 内容进程并关闭 cache/prefetch；**不要**默认开启 `TURNSTILE_LOW_RESOURCE_MODE=1`（容易导致 Turnstile 失败）。
 - 如果 Turnstile 长时间没有返回 token，`TURNSTILE_SOLVE_TIMEOUT_SEC` 会提前结束浏览器求解，避免失败任务持续占用高 CPU / 高内存。
 - 如果 compact 档影响通过率，先改成 `TURNSTILE_CAMOUFOX_PROFILE=balanced`；仍有问题再设 `off`。
@@ -328,6 +328,9 @@ curl -s http://127.0.0.1:5072/health
 | `browser_process_rss_mb` | 浏览器相关子进程 RSS 总和 |
 | `browser_process_count` | 浏览器相关子进程数量 |
 | `browser_cpu_ticks` | 浏览器相关子进程累计 CPU ticks，用于判断任务期间 CPU 是否主要消耗在浏览器 |
+| `cgroup_memory_current_mb` | Docker cgroup 当前内存计费，包含容器内存及部分缓存 |
+| `cgroup_memory_peak_mb` | Docker cgroup 自启动以来记录的内存峰值 |
+| `cgroup_cpu_percent` | 两次 `/health` 采样之间的 cgroup CPU 使用率；100% 约等于一个满载 CPU 核心 |
 | `browser_processes` | 浏览器相关子进程列表 |
 | `pool_ready` | 浏览器池是否仍处于可用状态 |
 | `owned` | 当前服务持有的真实浏览器实例数量 |
@@ -404,9 +407,9 @@ TURNSTILE_CAMOUFOX_PROFILE: compact
 TURNSTILE_UNBLOCK_RENDERING: "0"
 TURNSTILE_WORKER_MODE: inline
 TURNSTILE_WORKER_TIMEOUT: "120"
-TURNSTILE_BROWSER_RECYCLE_TASKS: "25"
-TURNSTILE_BROWSER_RECYCLE_RSS_MB: "800"
-TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC: "30"
+TURNSTILE_BROWSER_RECYCLE_TASKS: "8"
+TURNSTILE_BROWSER_RECYCLE_RSS_MB: "700"
+TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC: "120"
 TURNSTILE_BROWSER_INSTANCES: "1"
 TURNSTILE_THREAD: "1"
 shm_size: "536870912"
@@ -518,7 +521,7 @@ tests/                     部署配置和资源策略回归测试
 
 ### 为什么解题期间内存会升高？
 
-Turnstile 求解需要真实浏览器。当前默认使用 Camoufox compact 档、单浏览器实例、资源拦截和 60 秒 idle 回收来压低峰值和持续时间。连续调用时浏览器会常驻复用；如果 60 秒没有新调用，会自动释放。
+Turnstile 求解需要真实浏览器。当前默认使用 Camoufox compact 档、单浏览器实例、资源拦截和 300 秒 idle 回收来压低峰值和持续时间。连续调用时浏览器会常驻复用；如果 300 秒没有新调用，会自动释放。
 
 ### Docker 面板显示的内存和 `/health` 不一致怎么办？
 

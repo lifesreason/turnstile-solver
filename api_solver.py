@@ -94,9 +94,9 @@ class TurnstileAPIServer:
         lazy_raw = (os.getenv("TURNSTILE_LAZY", "1") or "1").strip().lower()
         self.lazy_browsers = lazy_raw not in ("0", "false", "no", "off")
         try:
-            self.idle_sec = float(os.getenv("TURNSTILE_IDLE_SEC", "60") or 60)
+            self.idle_sec = float(os.getenv("TURNSTILE_IDLE_SEC", "300") or 300)
         except (TypeError, ValueError):
-            self.idle_sec = 60.0
+            self.idle_sec = 300.0
         if self.idle_sec < 0:
             self.idle_sec = 0.0
         self._pool_ready = False
@@ -110,21 +110,21 @@ class TurnstileAPIServer:
         self._tasks_since_recycle = 0
         self._browser_pid_map: dict[int, set[int]] = {}
         try:
-            # Recycle more often than the old 100-task default so long-running
+            # Recycle regularly so long-running
             # keep-alive pools cannot drift toward multi-GB Firefox trees.
-            self.browser_recycle_tasks = int(os.getenv("TURNSTILE_BROWSER_RECYCLE_TASKS", "25") or 25)
+            self.browser_recycle_tasks = int(os.getenv("TURNSTILE_BROWSER_RECYCLE_TASKS", "8") or 8)
         except (TypeError, ValueError):
-            self.browser_recycle_tasks = 25
+            self.browser_recycle_tasks = 8
         if self.browser_recycle_tasks < 0:
             self.browser_recycle_tasks = 0
         try:
             # Soft RSS guard: after a task, if browser tree exceeds this, rebuild.
-            # 0 disables. Default 800MB catches the 1GB+ climb before 1.5GB panels.
+            # 0 disables. Default 700MB catches long-run growth before 1GB+ panels.
             self.browser_recycle_rss_mb = float(
-                os.getenv("TURNSTILE_BROWSER_RECYCLE_RSS_MB", "800") or 800
+                os.getenv("TURNSTILE_BROWSER_RECYCLE_RSS_MB", "700") or 700
             )
         except (TypeError, ValueError):
-            self.browser_recycle_rss_mb = 800.0
+            self.browser_recycle_rss_mb = 700.0
         if self.browser_recycle_rss_mb < 0:
             self.browser_recycle_rss_mb = 0.0
         try:
@@ -156,12 +156,12 @@ class TurnstileAPIServer:
             self.solve_timeout_sec = 60.0
         try:
             self.max_pending_tasks = int(
-                os.getenv("TURNSTILE_MAX_PENDING_TASKS", "4") or 4
+                os.getenv("TURNSTILE_MAX_PENDING_TASKS", "2") or 2
             )
         except (TypeError, ValueError):
-            self.max_pending_tasks = 4
+            self.max_pending_tasks = 2
         if self.max_pending_tasks < 1:
-            self.max_pending_tasks = 4
+            self.max_pending_tasks = 2
         try:
             self.health_stuck_sec = float(
                 os.getenv("TURNSTILE_HEALTH_STUCK_SEC", "180") or 180
@@ -174,6 +174,7 @@ class TurnstileAPIServer:
         self._worker_tasks_running = 0
         self._worker_tasks_completed = 0
         self._task_started_at: dict[str, float] = {}
+        self._cgroup_cpu_sample: Optional[tuple[float, int]] = None
         self._worker_semaphore = asyncio.Semaphore(self.thread_count)
 
         # Initialize useragent and sec_ch_ua attributes
@@ -724,6 +725,76 @@ class TurnstileAPIServer:
                 }
                 for pid in sorted(browser_pids)
             ],
+            **self._cgroup_resource_report(),
+        }
+
+    @staticmethod
+    def _read_integer_file(paths: tuple[str, ...]) -> Optional[int]:
+        """Read the first available integer from cgroup v2/v1 paths."""
+        for path in paths:
+            try:
+                with open(path, encoding="utf-8") as value_file:
+                    value = value_file.read().strip()
+                if value.isdigit():
+                    return int(value)
+            except (OSError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _read_cgroup_cpu_usage_usec() -> Optional[int]:
+        """Read cumulative cgroup CPU time, normalized to microseconds."""
+        for path in ("/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/cpuacct/cpuacct.usage"):
+            try:
+                with open(path, encoding="utf-8") as value_file:
+                    content = value_file.read()
+            except OSError:
+                continue
+
+            if path.endswith("cpu.stat"):
+                for line in content.splitlines():
+                    key, _, value = line.partition(" ")
+                    if key == "usage_usec" and value.strip().isdigit():
+                        return int(value.strip())
+            elif content.strip().isdigit():
+                # cgroup v1 exposes cpuacct.usage in nanoseconds.
+                return int(content.strip()) // 1000
+        return None
+
+    def _cgroup_resource_report(self) -> dict:
+        """Report cgroup memory and CPU usage for Docker-level diagnostics."""
+        current_bytes = self._read_integer_file((
+            "/sys/fs/cgroup/memory.current",
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        ))
+        peak_bytes = self._read_integer_file((
+            "/sys/fs/cgroup/memory.peak",
+            "/sys/fs/cgroup/memory/memory.max_usage_in_bytes",
+        ))
+        cpu_usage_usec = self._read_cgroup_cpu_usage_usec()
+        cpu_percent = None
+        if cpu_usage_usec is not None:
+            now = time.monotonic()
+            previous = self._cgroup_cpu_sample
+            if previous is not None:
+                elapsed = now - previous[0]
+                usage_delta = cpu_usage_usec - previous[1]
+                if elapsed > 0 and usage_delta >= 0:
+                    # 100% means one fully utilized CPU core.
+                    cpu_percent = round((usage_delta / 1_000_000.0) / elapsed * 100.0, 1)
+            self._cgroup_cpu_sample = (now, cpu_usage_usec)
+
+        return {
+            "cgroup_memory_current_mb": (
+                round(current_bytes / 1024.0 / 1024.0, 1)
+                if current_bytes is not None else None
+            ),
+            "cgroup_memory_peak_mb": (
+                round(peak_bytes / 1024.0 / 1024.0, 1)
+                if peak_bytes is not None else None
+            ),
+            "cgroup_cpu_usage_usec": cpu_usage_usec,
+            "cgroup_cpu_percent": cpu_percent,
         }
 
     async def _force_kill_browser(self, browser, index: int | None = None) -> None:
